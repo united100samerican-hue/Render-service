@@ -4,11 +4,13 @@ import asyncio
 import inspect
 import logging
 import os
+import tempfile
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Optional
 
+import httpx
 from pydantic import BaseModel, Field
 from telethon import TelegramClient
 from telethon.sessions import StringSession
@@ -26,6 +28,8 @@ SESSION_STRING = os.getenv("SESSION_STRING", "").strip()
 API_ID = int(os.getenv("API_ID", "0") or 0)
 API_HASH = os.getenv("API_HASH", "").strip()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+
+USER_AGENT = "RenderAudioService/1.1"
 
 
 class MetaRequest(BaseModel):
@@ -65,6 +69,7 @@ class AudioSession:
     started_at: float = 0.0
     updated_at: float = 0.0
     last_error: str = ""
+    local_path: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -99,12 +104,10 @@ class AudioService:
             return await value
         return value
 
-    async def _call_method(self, names: list[str], *args: Any, **kwargs: Any) -> Any:
-        if not self.calls:
-            raise RuntimeError("calls_not_ready")
+    async def _maybe_call(self, obj: Any, method_names: list[str], *args: Any, **kwargs: Any) -> Any:
         last_exc: Exception | None = None
-        for name in names:
-            fn = getattr(self.calls, name, None)
+        for name in method_names:
+            fn = getattr(obj, name, None)
             if not callable(fn):
                 continue
             try:
@@ -114,7 +117,7 @@ class AudioService:
                 continue
         if last_exc:
             raise last_exc
-        raise RuntimeError(f"method_not_supported: {','.join(names)}")
+        raise RuntimeError(f"method_not_supported: {','.join(method_names)}")
 
     def _normalize_source(self, source_type: str, source_id: str) -> str:
         src = str(source_id or "").strip()
@@ -137,13 +140,55 @@ class AudioService:
 
         return src
 
+    async def _download_via_bot_api(self, file_id: str) -> str:
+        if not BOT_TOKEN:
+            raise RuntimeError("BOT_TOKEN missing")
+
+        async with httpx.AsyncClient(timeout=120, headers={"User-Agent": USER_AGENT}) as client:
+            r = await client.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getFile", params={"file_id": file_id})
+            j = r.json()
+            if not j.get("ok"):
+                raise RuntimeError(j.get("description") or "getFile_failed")
+            file_path = j["result"]["file_path"]
+            dl = await client.get(f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}")
+            dl.raise_for_status()
+
+        suffix = Path(file_path).suffix or ".bin"
+        fd, out_path = tempfile.mkstemp(prefix="audio_", suffix=suffix)
+        os.close(fd)
+        with open(out_path, "wb") as f:
+            f.write(dl.content)
+        return out_path
+
+    async def _materialize_source(self, source_type: str, source_id: str) -> str:
+        src = self._normalize_source(source_type, source_id)
+
+        # direct URL or local file path
+        if src.startswith(("http://", "https://")):
+            return src
+
+        p = Path(src)
+        if p.exists():
+            return str(p.resolve())
+
+        # Telegram file_id fallback
+        st = str(source_type or "").lower().strip()
+        if st in {"telegram", "tg", "telegram_file", "file_id"} or len(src) >= 20:
+            try:
+                return await self._download_via_bot_api(src)
+            except Exception:
+                # if it looks like a file_id but getFile failed, surface the real error
+                raise
+
+        return src
+
     async def ensure_ready(self) -> None:
         async with self._lock:
             if self.ready:
                 return
 
-            env_ok, reason = self._env_ok()
-            if not env_ok:
+            ok, reason = self._env_ok()
+            if not ok:
                 self.backend_error = reason
                 self.ready = False
                 logger.error("audio env missing: %s", reason)
@@ -193,6 +238,7 @@ class AudioService:
                 "started_at": 0,
                 "updated_at": 0,
                 "last_error": "",
+                "local_path": "",
             }
         return {
             "ok": True,
@@ -207,6 +253,7 @@ class AudioService:
             "started_at": s.started_at,
             "updated_at": s.updated_at,
             "last_error": s.last_error,
+            "local_path": s.local_path,
         }
 
     async def meta(self, payload: MetaRequest) -> dict[str, Any]:
@@ -225,9 +272,9 @@ class AudioService:
         if not self.ready:
             raise RuntimeError(f"service_not_ready: {self.backend_error or 'missing_env'}")
 
-        source = self._normalize_source(payload.source_type, payload.source_id)
-
         async with self._lock:
+            source = await self._materialize_source(payload.source_type, payload.source_id)
+
             prev = self._sessions.get(payload.chat_id)
             if prev and prev.status == "playing" and prev.source_id == source:
                 return self._state(payload.chat_id)
@@ -236,11 +283,12 @@ class AudioService:
                 await self._stop_locked(payload.chat_id, keep_state=False)
 
             try:
-                await self._call_method(["play", "start"], int(payload.chat_id), source)
+                await self._maybe_call(self.calls, ["play"], int(payload.chat_id), source)
             except Exception as exc:
+                logger.exception("audio play failed", extra={"chat_id": payload.chat_id, "source": source})
                 s = self._sessions.get(payload.chat_id) or AudioSession(chat_id=payload.chat_id)
                 s.status = "error"
-                s.last_error = str(exc)
+                s.last_error = f"{type(exc).__name__}: {exc}"
                 s.updated_at = time.time()
                 self._sessions[payload.chat_id] = s
                 raise
@@ -255,6 +303,7 @@ class AudioService:
             s.started_at = s.started_at or time.time()
             s.updated_at = time.time()
             s.last_error = ""
+            s.local_path = source if Path(source).exists() else ""
             self._sessions[payload.chat_id] = s
             return self._state(payload.chat_id)
 
@@ -264,7 +313,7 @@ class AudioService:
             raise RuntimeError(f"service_not_ready: {self.backend_error or 'missing_env'}")
 
         async with self._lock:
-            await self._call_method(["pause", "pause_playout"], int(chat_id))
+            await self._maybe_call(self.calls, ["pause"], int(chat_id))
             s = self._sessions.get(chat_id) or AudioSession(chat_id=chat_id)
             s.status = "paused"
             s.paused = True
@@ -278,7 +327,7 @@ class AudioService:
             raise RuntimeError(f"service_not_ready: {self.backend_error or 'missing_env'}")
 
         async with self._lock:
-            await self._call_method(["resume", "resume_playout"], int(chat_id))
+            await self._maybe_call(self.calls, ["resume"], int(chat_id))
             s = self._sessions.get(chat_id) or AudioSession(chat_id=chat_id)
             s.status = "playing"
             s.paused = False
@@ -288,15 +337,16 @@ class AudioService:
 
     async def _stop_locked(self, chat_id: int, keep_state: bool = False) -> dict[str, Any]:
         try:
-            await self._call_method(["stop", "leave", "disconnect"], int(chat_id))
+            await self._maybe_call(self.calls, ["stop"], int(chat_id))
         except Exception as exc:
             s = self._sessions.get(chat_id) or AudioSession(chat_id=chat_id)
-            s.last_error = str(exc)
+            s.last_error = f"{type(exc).__name__}: {exc}"
             s.status = "error"
             s.updated_at = time.time()
             self._sessions[chat_id] = s
             if not keep_state:
                 raise
+
         s = self._sessions.get(chat_id) or AudioSession(chat_id=chat_id)
         s.status = "stopped"
         s.paused = False
@@ -321,7 +371,10 @@ class AudioService:
             raise RuntimeError(f"service_not_ready: {self.backend_error or 'missing_env'}")
 
         async with self._lock:
-            fn = getattr(self.calls, "seek", None) if self.calls else None
+            # try a few common names; if unsupported, return a clean error
+            if not self.calls:
+                raise RuntimeError("calls_not_ready")
+            fn = getattr(self.calls, "seek", None)
             if not callable(fn):
                 return {
                     "ok": False,
