@@ -4,157 +4,177 @@ import logging
 import os
 from typing import Any
 
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, Request
+from fastapi.responses import JSONResponse
 
-from service import AudioService, ControlRequest, MetaRequest, SeekRequest, StartRequest
+from service import ControlRequest, MetaRequest, SeekRequest, StartRequest, service
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("audio_app")
 
-app = FastAPI(title="Audio Service", version="1.1.0")
-service = AudioService()
-
+app = FastAPI(title="Render Audio Service", version="3.0")
 KEEPALIVE_SECRET = os.getenv("KEEPALIVE_SECRET", "").strip()
 
 
 def _guard(secret: str | None) -> None:
     if KEEPALIVE_SECRET and (secret or "").strip() != KEEPALIVE_SECRET:
-        raise HTTPException(status_code=403, detail="forbidden")
+        raise RuntimeError("forbidden")
 
 
-def _to_model(model_cls: Any, data: dict[str, Any]) -> Any:
-    fields = getattr(model_cls, "model_fields", None)
-    if isinstance(fields, dict) and fields:
-        allowed = set(fields.keys())
-    else:
-        allowed = set(getattr(model_cls, "__annotations__", {}) or {})
-    if allowed:
-        data = {k: v for k, v in data.items() if k in allowed}
-    return model_cls(**data)
+def _coerce_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+async def _json(req: Request) -> dict[str, Any]:
+    try:
+        body = await req.json()
+        return body if isinstance(body, dict) else {}
+    except Exception:
+        return {}
+
+
+def _chat_id(body: dict[str, Any]) -> int:
+    return _coerce_int(body.get("chatId", body.get("chat_id", 0)))
+
+
+def _source_type(body: dict[str, Any]) -> str:
+    return str(body.get("source_type", body.get("sourceType", "url")) or "url")
+
+
+def _source_id(body: dict[str, Any]) -> str:
+    return str(body.get("source_id", body.get("sourceId", "")) or "")
+
+
+def _title(body: dict[str, Any]) -> str:
+    return str(body.get("title", "") or "")
+
+
+def _duration(body: dict[str, Any]) -> int:
+    return _coerce_int(body.get("duration", 0))
 
 
 @app.on_event("startup")
 async def _startup() -> None:
-    try:
-        await service.ensure_ready()
-        logger.info("startup_done", extra={"ready": service.ready, "backend_error": service.backend_error})
-    except Exception:
-        logger.exception("audio startup failed")
+    await service.ensure_ready()
+    logger.info("startup_done")
 
 
 @app.get("/")
-async def root():
-    return {"ok": True, "service": "audio"}
+async def root() -> dict[str, Any]:
+    return {"ok": True, "service": "render-audio-service", "ready": service.ready}
+
+
+@app.get("/ping")
+async def ping(x_keepalive_secret: str | None = Header(default=None)) -> dict[str, Any]:
+    _guard(x_keepalive_secret)
+    return {"ok": True}
+
+
+@app.get("/healthz")
+async def healthz() -> dict[str, Any]:
+    return {"ok": True, "ready": True}
 
 
 @app.get("/health")
-async def health():
+async def health() -> dict[str, Any]:
     return {
         "ok": True,
+        "service": "render-audio-service",
         "ready": service.ready,
-        "backend_error": service.backend_error,
         "active_sessions": service.active_sessions_count(),
+        "backend_error": service.backend_error,
     }
 
 
 @app.post("/meta")
-async def meta(
-    req: Request,
-    x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret"),
-):
+async def meta(req: Request, x_keepalive_secret: str | None = Header(default=None)):
     _guard(x_keepalive_secret)
-    body = await req.json()
-    payload = _to_model(
-        MetaRequest,
-        {
-            "chat_id": int(body.get("chatId", body.get("chat_id", 0)) or 0),
-            "source_type": str(body.get("source_type", body.get("sourceType", "url"))),
-            "source_id": str(body.get("source_id", body.get("sourceId", ""))),
-            "title": str(body.get("title", "")),
-            "duration": int(body.get("duration", 0) or 0),
-        },
-    )
-    return await service.meta(payload)
+    body = await _json(req)
+    try:
+        state = await service.meta(
+            MetaRequest(
+                chat_id=_chat_id(body),
+                source_type=_source_type(body),
+                source_id=_source_id(body),
+                title=_title(body),
+                duration=_duration(body),
+            )
+        )
+        return {"ok": True, "action": "meta", "state": state}
+    except Exception as e:
+        logger.exception("meta failed")
+        return {"ok": False, "error": type(e).__name__, "detail": str(e)}
 
 
 @app.post("/start")
-async def start(
-    req: Request,
-    x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret"),
-):
+async def start(req: Request, x_keepalive_secret: str | None = Header(default=None)):
     _guard(x_keepalive_secret)
-    body = await req.json()
-    payload = _to_model(
-        StartRequest,
-        {
-            "chat_id": int(body.get("chatId", body.get("chat_id", 0)) or 0),
-            "source_type": str(body.get("source_type", body.get("sourceType", "url"))),
-            "source_id": str(body.get("source_id", body.get("sourceId", ""))),
-            "title": str(body.get("title", "")),
-            "duration": int(body.get("duration", 0) or 0),
-        },
-    )
+    body = await _json(req)
     try:
-        return await service.start(payload)
+        state = await service.start(
+            StartRequest(
+                chat_id=_chat_id(body),
+                source_type=_source_type(body),
+                source_id=_source_id(body),
+                title=_title(body),
+                duration=_duration(body),
+            )
+        )
+        return {"ok": True, "action": "start", "state": state}
     except Exception as e:
-        logger.exception("audio start failed", extra={"body": body})
-        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+        logger.exception("start failed")
+        return {"ok": False, "error": type(e).__name__, "detail": str(e)}
 
 
 @app.post("/pause")
-async def pause(
-    req: Request,
-    x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret"),
-):
+async def pause(req: Request, x_keepalive_secret: str | None = Header(default=None)):
     _guard(x_keepalive_secret)
-    body = await req.json()
-    payload = _to_model(
-        ControlRequest,
-        {"chat_id": int(body.get("chatId", body.get("chat_id", 0)) or 0)},
-    )
-    return await service.pause(payload.chat_id)
+    body = await _json(req)
+    try:
+        state = await service.pause(_chat_id(body))
+        return {"ok": True, "action": "pause", "state": state}
+    except Exception as e:
+        logger.exception("pause failed")
+        return {"ok": False, "error": type(e).__name__, "detail": str(e)}
 
 
 @app.post("/resume")
-async def resume(
-    req: Request,
-    x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret"),
-):
+async def resume(req: Request, x_keepalive_secret: str | None = Header(default=None)):
     _guard(x_keepalive_secret)
-    body = await req.json()
-    payload = _to_model(
-        ControlRequest,
-        {"chat_id": int(body.get("chatId", body.get("chat_id", 0)) or 0)},
-    )
-    return await service.resume(payload.chat_id)
+    body = await _json(req)
+    try:
+        state = await service.resume(_chat_id(body))
+        return {"ok": True, "action": "resume", "state": state}
+    except Exception as e:
+        logger.exception("resume failed")
+        return {"ok": False, "error": type(e).__name__, "detail": str(e)}
 
 
 @app.post("/stop")
-async def stop(
-    req: Request,
-    x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret"),
-):
+async def stop(req: Request, x_keepalive_secret: str | None = Header(default=None)):
     _guard(x_keepalive_secret)
-    body = await req.json()
-    payload = _to_model(
-        ControlRequest,
-        {"chat_id": int(body.get("chatId", body.get("chat_id", 0)) or 0)},
-    )
-    return await service.stop(payload.chat_id)
+    body = await _json(req)
+    try:
+        state = await service.stop(_chat_id(body))
+        return {"ok": True, "action": "stop", "state": state}
+    except Exception as e:
+        logger.exception("stop failed")
+        return JSONResponse(
+            status_code=200,
+            content={"ok": False, "action": "stop", "error": type(e).__name__, "detail": str(e)},
+        )
 
 
 @app.post("/seek")
-async def seek(
-    req: Request,
-    x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret"),
-):
+async def seek(req: Request, x_keepalive_secret: str | None = Header(default=None)):
     _guard(x_keepalive_secret)
-    body = await req.json()
-    payload = _to_model(
-        SeekRequest,
-        {
-            "chat_id": int(body.get("chatId", body.get("chat_id", 0)) or 0),
-            "delta": int(body.get("delta", 0) or 0),
-        },
-    )
-    return await service.seek(payload.chat_id, payload.delta)
+    body = await _json(req)
+    try:
+        state = await service.seek(_chat_id(body), _coerce_int(body.get("delta", 0)))
+        return {"ok": True, "action": "seek", "state": state}
+    except Exception as e:
+        logger.exception("seek failed")
+        return {"ok": False, "error": type(e).__name__, "detail": str(e)}
