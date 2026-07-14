@@ -9,9 +9,9 @@ RUN apt-get update \
 
 WORKDIR /app
 
-COPY services/audio/requirements.txt ./requirements.txt
+COPY requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY services/audio/ .
+COPY . .
 
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "10000"]
