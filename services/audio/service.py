@@ -338,41 +338,63 @@ class AudioService:
             self._sessions[chat_id] = s
             return self._state(chat_id)
 
-    async def _stop_backend(self, chat_id: int) -> None:
+    async def _stop_backend(self, chat_id: int) -> str:
         """
         Try the backend stop/leave variants without hard failing on one missing name.
-        Different PyTgCalls builds expose different method names.
+        Different PyTgCalls / tgcalls builds expose slightly different method names.
         """
         if not self.calls:
             raise RuntimeError("calls_not_ready")
 
+        # Canonical modern flow: stop() with no args, then leave_current_group_call().
+        # Also try a few legacy/custom method names so the service works across builds.
         candidates: list[tuple[str, tuple[Any, ...]]] = [
             ("stop", ()),
             ("leave_current_group_call", ()),
             ("leave_group_call", ()),
             ("leave", ()),
-            ("stop_stream", (int(chat_id),)),
-            ("stop", (int(chat_id),)),
         ]
 
-        last_exc: Exception | None = None
-        for method_name, args in candidates:
+        tried: list[str] = []
+        for method_name, base_args in candidates:
             fn = getattr(self.calls, method_name, None)
             if not callable(fn):
-                continue
-            try:
-                await self._maybe_await(fn(*args))
-                return
-            except TypeError as exc:
-                last_exc = exc
-                continue
-            except Exception as exc:
-                last_exc = exc
+                tried.append(f"{method_name}:missing")
                 continue
 
-        if last_exc:
-            raise last_exc
-        raise RuntimeError("method_not_supported: stop")
+            # Prefer the zero-argument form first. If the backend expects chat_id,
+            # try that once before moving to the next candidate.
+            for args in (base_args, (int(chat_id),)):
+                try:
+                    result = fn(*args)
+                    await self._maybe_await(result)
+                    return method_name
+                except TypeError as exc:
+                    tried.append(f"{method_name}{args}:type_error:{exc}")
+                    continue
+                except Exception as exc:
+                    tried.append(f"{method_name}{args}:{type(exc).__name__}:{exc}")
+                    break
+
+        # Lower-level shutdown helpers for custom wrappers.
+        for method_name in ("stop_playout", "stop_output", "stop_stream"):
+            fn = getattr(self.calls, method_name, None)
+            if not callable(fn):
+                tried.append(f"{method_name}:missing")
+                continue
+            for args in ((), (int(chat_id),)):
+                try:
+                    result = fn(*args)
+                    await self._maybe_await(result)
+                    return method_name
+                except TypeError as exc:
+                    tried.append(f"{method_name}{args}:type_error:{exc}")
+                    continue
+                except Exception as exc:
+                    tried.append(f"{method_name}{args}:{type(exc).__name__}:{exc}")
+                    break
+
+        raise RuntimeError("method_not_supported: stop; tried=" + " | ".join(tried[:12]))
 
     async def _stop_locked(self, chat_id: int, keep_state: bool = False) -> dict[str, Any]:
         try:
