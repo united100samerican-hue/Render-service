@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import asyncio
@@ -28,7 +29,6 @@ SESSION_STRING = os.getenv("SESSION_STRING", "").strip()
 API_ID = int(os.getenv("API_ID", "0") or 0)
 API_HASH = os.getenv("API_HASH", "").strip()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-
 USER_AGENT = "RenderAudioService/1.1"
 
 
@@ -145,20 +145,24 @@ class AudioService:
             raise RuntimeError("BOT_TOKEN missing")
 
         async with httpx.AsyncClient(timeout=120, headers={"User-Agent": USER_AGENT}) as client:
-            r = await client.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getFile", params={"file_id": file_id})
+            r = await client.get(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/getFile",
+                params={"file_id": file_id},
+            )
             j = r.json()
             if not j.get("ok"):
                 raise RuntimeError(j.get("description") or "getFile_failed")
+
             file_path = j["result"]["file_path"]
             dl = await client.get(f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}")
             dl.raise_for_status()
 
-        suffix = Path(file_path).suffix or ".bin"
-        fd, out_path = tempfile.mkstemp(prefix="audio_", suffix=suffix)
-        os.close(fd)
-        with open(out_path, "wb") as f:
-            f.write(dl.content)
-        return out_path
+            suffix = Path(file_path).suffix or ".bin"
+            fd, out_path = tempfile.mkstemp(prefix="audio_", suffix=suffix)
+            os.close(fd)
+            with open(out_path, "wb") as f:
+                f.write(dl.content)
+            return out_path
 
     async def _materialize_source(self, source_type: str, source_id: str) -> str:
         src = self._normalize_source(source_type, source_id)
@@ -203,10 +207,8 @@ class AudioService:
             try:
                 self.client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
                 await self._maybe_await(self.client.start())
-
                 self.calls = PyTgCalls(self.client)
                 await self._maybe_await(self.calls.start())
-
                 self.ready = True
                 self.backend_error = ""
                 logger.info("audio service ready")
@@ -240,6 +242,7 @@ class AudioService:
                 "last_error": "",
                 "local_path": "",
             }
+
         return {
             "ok": True,
             "ready": self.ready,
@@ -335,9 +338,45 @@ class AudioService:
             self._sessions[chat_id] = s
             return self._state(chat_id)
 
+    async def _stop_backend(self, chat_id: int) -> None:
+        """
+        Try the backend stop/leave variants without hard failing on one missing name.
+        Different PyTgCalls builds expose different method names.
+        """
+        if not self.calls:
+            raise RuntimeError("calls_not_ready")
+
+        candidates: list[tuple[str, tuple[Any, ...]]] = [
+            ("stop", ()),
+            ("leave_current_group_call", ()),
+            ("leave_group_call", ()),
+            ("leave", ()),
+            ("stop_stream", (int(chat_id),)),
+            ("stop", (int(chat_id),)),
+        ]
+
+        last_exc: Exception | None = None
+        for method_name, args in candidates:
+            fn = getattr(self.calls, method_name, None)
+            if not callable(fn):
+                continue
+            try:
+                await self._maybe_await(fn(*args))
+                return
+            except TypeError as exc:
+                last_exc = exc
+                continue
+            except Exception as exc:
+                last_exc = exc
+                continue
+
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("method_not_supported: stop")
+
     async def _stop_locked(self, chat_id: int, keep_state: bool = False) -> dict[str, Any]:
         try:
-            await self._maybe_call(self.calls, ["stop"], int(chat_id))
+            await self._stop_backend(chat_id)
         except Exception as exc:
             s = self._sessions.get(chat_id) or AudioSession(chat_id=chat_id)
             s.last_error = f"{type(exc).__name__}: {exc}"
@@ -374,6 +413,7 @@ class AudioService:
             # try a few common names; if unsupported, return a clean error
             if not self.calls:
                 raise RuntimeError("calls_not_ready")
+
             fn = getattr(self.calls, "seek", None)
             if not callable(fn):
                 return {
@@ -381,8 +421,10 @@ class AudioService:
                     "error": "seek_not_supported_by_installed_backend",
                     **self._state(chat_id),
                 }
+
             result = fn(int(chat_id), int(delta))
             await self._maybe_await(result)
+
             s = self._sessions.get(chat_id) or AudioSession(chat_id=chat_id)
             s.updated_at = time.time()
             self._sessions[chat_id] = s
