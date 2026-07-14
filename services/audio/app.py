@@ -78,7 +78,8 @@ async def meta(
     try:
         return await service.meta(payload)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    logger.exception("audio start failed", extra={"body": body})
+    raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
 
 @app.post("/start")
