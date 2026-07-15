@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import logging
@@ -6,21 +7,12 @@ from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException, Request
 
-from service import (
-    AudioService,
-    ControlRequest,
-    MetaRequest,
-    QueueAddRequest,
-    SeekRequest,
-    StartRequest,
-    service,
-)
+from service import AudioService, ControlRequest, MetaRequest, QueueAddRequest, SeekRequest, StartRequest, service
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("audio_app")
 
-app = FastAPI(title="Render Audio Service", version="4.0")
-
+app = FastAPI(title="Render Audio Service", version="5.0")
 KEEPALIVE_SECRET = os.getenv("KEEPALIVE_SECRET", "").strip()
 
 
@@ -56,7 +48,7 @@ def _make_meta(body: dict[str, Any]) -> MetaRequest:
 def _make_start(body: dict[str, Any]) -> StartRequest:
     return StartRequest(
         chat_id=_coerce_int(_pick(body, "chatId", "chat_id", default=0)),
-        source_type=str(_pick(body, "source_type", "sourceType", default="url")),
+        source_type=str(_pick(body, "source_type", "sourceType", default="telegram")),
         source_id=str(_pick(body, "source_id", "sourceId", default="")),
         title=str(_pick(body, "title", default="")),
         duration=_coerce_int(_pick(body, "duration", default=0)),
@@ -78,7 +70,7 @@ def _make_seek(body: dict[str, Any]) -> SeekRequest:
 def _make_queue_add(body: dict[str, Any]) -> QueueAddRequest:
     return QueueAddRequest(
         chat_id=_coerce_int(_pick(body, "chatId", "chat_id", default=0)),
-        source_type=str(_pick(body, "source_type", "sourceType", default="url")),
+        source_type=str(_pick(body, "source_type", "sourceType", default="telegram")),
         source_id=str(_pick(body, "source_id", "sourceId", default="")),
         title=str(_pick(body, "title", default="")),
         duration=_coerce_int(_pick(body, "duration", default=0)),
@@ -118,20 +110,14 @@ async def health():
 
 
 @app.post("/meta")
-async def meta(
-    req: Request,
-    x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret"),
-):
+async def meta(req: Request, x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret")):
     _guard(x_keepalive_secret)
     body = await req.json()
     return await service.meta(_make_meta(body))
 
 
 @app.post("/start")
-async def start(
-    req: Request,
-    x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret"),
-):
+async def start(req: Request, x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret")):
     _guard(x_keepalive_secret)
     body = await req.json()
     try:
@@ -142,40 +128,28 @@ async def start(
 
 
 @app.post("/pause")
-async def pause(
-    req: Request,
-    x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret"),
-):
+async def pause(req: Request, x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret")):
     _guard(x_keepalive_secret)
     body = await req.json()
     return await service.pause(_make_control(body).chat_id)
 
 
 @app.post("/resume")
-async def resume(
-    req: Request,
-    x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret"),
-):
+async def resume(req: Request, x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret")):
     _guard(x_keepalive_secret)
     body = await req.json()
     return await service.resume(_make_control(body).chat_id)
 
 
 @app.post("/stop")
-async def stop(
-    req: Request,
-    x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret"),
-):
+async def stop(req: Request, x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret")):
     _guard(x_keepalive_secret)
     body = await req.json()
     return await service.stop(_make_control(body).chat_id)
 
 
 @app.post("/seek")
-async def seek(
-    req: Request,
-    x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret"),
-):
+async def seek(req: Request, x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret")):
     _guard(x_keepalive_secret)
     body = await req.json()
     seek_req = _make_seek(body)
@@ -183,10 +157,7 @@ async def seek(
 
 
 @app.post("/enqueue")
-async def enqueue(
-    req: Request,
-    x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret"),
-):
+async def enqueue(req: Request, x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret")):
     _guard(x_keepalive_secret)
     body = await req.json()
     try:
@@ -197,10 +168,7 @@ async def enqueue(
 
 
 @app.post("/queue")
-async def queue(
-    req: Request,
-    x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret"),
-):
+async def queue(req: Request, x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret")):
     _guard(x_keepalive_secret)
     body = await req.json()
     chat_id = _coerce_int(_pick(body, "chatId", "chat_id", default=0))
@@ -208,10 +176,7 @@ async def queue(
 
 
 @app.post("/clear")
-async def clear(
-    req: Request,
-    x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret"),
-):
+async def clear(req: Request, x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret")):
     _guard(x_keepalive_secret)
     body = await req.json()
     chat_id = _coerce_int(_pick(body, "chatId", "chat_id", default=0))
@@ -219,10 +184,7 @@ async def clear(
 
 
 @app.post("/skip")
-async def skip(
-    req: Request,
-    x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret"),
-):
+async def skip(req: Request, x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret")):
     _guard(x_keepalive_secret)
     body = await req.json()
     chat_id = _coerce_int(_pick(body, "chatId", "chat_id", default=0))
