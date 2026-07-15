@@ -4,7 +4,7 @@ import logging
 import os
 from typing import Any
 
-from fastapi import FastAPI, Header, Request
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from service import (
@@ -21,16 +21,22 @@ from service import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("audio_app")
 
-app = FastAPI(title="Render Audio Service", version="4.0.0")
+app = FastAPI(title="Render Audio Service", version="5.0.0")
 service = AudioService()
-
 KEEPALIVE_SECRET = os.getenv("KEEPALIVE_SECRET", "").strip()
+
+ALLOWED_SOURCE_TYPES = {
+    "file_id",
+    "telegram_file_id",
+    "telegram",
+    "telegram_audio",
+    "telegram_video",
+}
 
 
 def _guard(secret: str | None) -> None:
     if KEEPALIVE_SECRET and (secret or "").strip() != KEEPALIVE_SECRET:
-        # Keep the error explicit; the bot can surface it if misconfigured.
-        raise RuntimeError("forbidden")
+        raise HTTPException(status_code=403, detail="forbidden")
 
 
 def _to_model(model_cls: Any, data: dict[str, Any]) -> Any:
@@ -64,6 +70,15 @@ def _body_str(body: dict[str, Any], *keys: str, default: str = "") -> str:
     return default
 
 
+def _normalize_source_type(body: dict[str, Any], default: str = "telegram_file_id") -> str:
+    st = _body_str(body, "source_type", "sourceType", default=default).strip().lower()
+    if not st:
+        st = default
+    if st not in ALLOWED_SOURCE_TYPES:
+        raise HTTPException(status_code=400, detail="unsupported_source_type")
+    return st
+
+
 async def _json(req: Request) -> dict[str, Any]:
     try:
         body = await req.json()
@@ -79,6 +94,14 @@ async def _startup() -> None:
         logger.info("startup_done", extra={"ready": service.ready, "backend_error": service.backend_error})
     except Exception:
         logger.exception("audio startup failed")
+
+
+@app.on_event("shutdown")
+async def _shutdown() -> None:
+    try:
+        await service.close()
+    except Exception:
+        logger.exception("audio shutdown failed")
 
 
 @app.get("/")
@@ -125,7 +148,7 @@ async def meta(
         MetaRequest,
         {
             "chat_id": _body_int(body, "chatId", "chat_id"),
-            "source_type": _body_str(body, "source_type", "sourceType", default="url"),
+            "source_type": _normalize_source_type(body),
             "source_id": _body_str(body, "source_id", "sourceId"),
             "title": _body_str(body, "title"),
             "duration": _body_int(body, "duration"),
@@ -149,7 +172,7 @@ async def start(
         StartRequest,
         {
             "chat_id": _body_int(body, "chatId", "chat_id"),
-            "source_type": _body_str(body, "source_type", "sourceType", default="url"),
+            "source_type": _normalize_source_type(body),
             "source_id": _body_str(body, "source_id", "sourceId"),
             "title": _body_str(body, "title"),
             "duration": _body_int(body, "duration"),
@@ -202,11 +225,15 @@ async def stop(
     body = await _json(req)
     payload = _to_model(ControlRequest, {"chat_id": _body_int(body, "chatId", "chat_id")})
     try:
-        return await service.stop(payload.chat_id)
+        result = await service.stop(payload.chat_id)
+        if not result.get("ok", False):
+            # Surface failures clearly to the caller so the bot does not report a false success.
+            return JSONResponse(status_code=502, content=result)
+        return result
     except Exception as e:
         logger.exception("stop failed")
         return JSONResponse(
-            status_code=200,
+            status_code=502,
             content={
                 "ok": False,
                 "action": "stop",
@@ -249,7 +276,7 @@ async def queue_add(
         QueueAddRequest,
         {
             "chat_id": _body_int(body, "chatId", "chat_id"),
-            "source_type": _body_str(body, "source_type", "sourceType", default="url"),
+            "source_type": _normalize_source_type(body),
             "source_id": _body_str(body, "source_id", "sourceId"),
             "title": _body_str(body, "title"),
             "duration": _body_int(body, "duration"),
@@ -315,3 +342,9 @@ async def queue_next(
     x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret"),
 ):
     return await queue_skip(req, x_keepalive_secret)
+
+
+if __name__ == "__main__":  # pragma: no cover
+    import uvicorn
+
+    uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "10000")), reload=False)
