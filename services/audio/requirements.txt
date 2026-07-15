@@ -1,6 +1,6 @@
 fastapi==0.139.0
 uvicorn[standard]==0.51.0
 telethon==1.44.0
-pytgcalls==2.3.3
+py-tgcalls==2.3.3
 pydantic==2.13.4
 httpx==0.28.1
