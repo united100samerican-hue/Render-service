@@ -17,6 +17,36 @@ app = FastAPI(title="Render Audio Service", version="4.0")
 KEEPALIVE_SECRET = os.getenv("KEEPALIVE_SECRET", "").strip()
 ALLOWED_SOURCE_TYPES = {"telegram", "telegram_file_id", "telegram_audio", "telegram_video", "file_id", "video_id"}
 
+SOURCE_TYPE_ALIASES = {
+    "telegram": "telegram_file_id",
+    "tg": "telegram_file_id",
+    "telegram_file_id": "telegram_file_id",
+    "telegram_media": "telegram_file_id",
+    "telegram_document": "telegram_file_id",
+    "document": "telegram_file_id",
+    "media": "telegram_file_id",
+    "file": "telegram_file_id",
+
+    "audio": "telegram_audio",
+    "voice": "telegram_audio",
+    "song": "telegram_audio",
+    "music": "telegram_audio",
+    "telegram_audio": "telegram_audio",
+
+    "video": "telegram_video",
+    "clip": "telegram_video",
+    "movie": "telegram_video",
+    "telegram_video": "telegram_video",
+
+    "file_id": "file_id",
+    "telegram_file": "file_id",
+
+    "video_id": "video_id",
+    "youtube": "video_id",
+    "yt": "video_id",
+    "youtube_video": "video_id",
+}
+
 
 def _guard(secret: str | None) -> None:
     if KEEPALIVE_SECRET and (secret or "").strip() != KEEPALIVE_SECRET:
@@ -50,11 +80,35 @@ def _source_id(body: dict[str, Any]) -> str:
 
 
 def _source_type(body: dict[str, Any]) -> str:
-    st = str(_pick(body, "sourceType", "source_type", default="telegram_file_id")).strip().lower()
-    if not st:
-        st = "telegram_file_id"
+    raw = str(_pick(body, "sourceType", "source_type", default="")).strip().lower()
+    mime = str(_pick(body, "mimeType", "mime_type", default="")).strip().lower()
+    kind = str(_pick(body, "mediaType", "media_type", "type", default="")).strip().lower()
+
+    if not raw:
+        if mime.startswith("audio/") or kind in {"audio", "voice", "music", "song"}:
+            raw = "audio"
+        elif mime.startswith("video/") or kind in {"video", "clip", "movie"}:
+            raw = "video"
+        elif kind in {"document", "file", "media"}:
+            raw = "document"
+        else:
+            raw = "telegram_file_id"
+
+    raw = raw.replace("-", "_")
+    st = SOURCE_TYPE_ALIASES.get(raw, raw)
+
     if st not in ALLOWED_SOURCE_TYPES:
-        raise HTTPException(status_code=400, detail="unsupported_source_type")
+        if raw in {"audio", "voice", "song", "music"}:
+            st = "telegram_audio"
+        elif raw in {"video", "clip", "movie"}:
+            st = "telegram_video"
+        elif raw in {"document", "file", "media", "telegram_document"}:
+            st = "telegram_file_id"
+        elif raw in {"youtube", "yt", "video_id", "youtube_video"}:
+            st = "video_id"
+        else:
+            raise HTTPException(status_code=400, detail=f"unsupported_source_type: {raw}")
+
     return st
 
 
