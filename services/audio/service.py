@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import asyncio
@@ -154,25 +153,43 @@ class AudioService:
     async def _maybe_await(self, value: Any) -> Any:
         return await value if inspect.isawaitable(value) else value
 
-    async def _call_variants(self, obj: Any, candidates: list[tuple[str, tuple[Any, ...], dict[str, Any]]]) -> Any:
-        if obj is None:
+    def _backend_targets(self) -> list[Any]:
+        targets: list[Any] = []
+        for obj in (
+            self.calls,
+            getattr(self.calls, "group_call", None),
+            getattr(self.calls, "_group_call", None),
+        ):
+            if obj and obj not in targets:
+                targets.append(obj)
+        return targets
+
+    async def _call_variants(
+        self,
+        candidates: list[tuple[str, tuple[Any, ...], dict[str, Any]]],
+        targets: Optional[list[Any]] = None,
+    ) -> Any:
+        targets = targets or self._backend_targets()
+        if not targets:
             raise RuntimeError("backend_not_ready")
+
         last_exc: Exception | None = None
-        for name, args, kwargs in candidates:
-            fn = getattr(obj, name, None)
-            if not callable(fn):
-                continue
-            try:
-                return await self._maybe_await(fn(*args, **kwargs))
-            except Exception as exc:
-                last_exc = exc
+        for target in targets:
+            for name, args, kwargs in candidates:
+                fn = getattr(target, name, None)
+                if not callable(fn):
+                    continue
+                try:
+                    return await self._maybe_await(fn(*args, **kwargs))
+                except Exception as exc:
+                    last_exc = exc
+
         if last_exc:
             raise last_exc
         raise RuntimeError("method_not_supported")
 
     async def _backend_play(self, chat_id: int, media_path: str) -> Any:
         return await self._call_variants(
-            self.calls,
             [
                 ("play", (chat_id, media_path), {}),
                 ("play", (), {"chat_id": chat_id, "source": media_path}),
@@ -181,36 +198,33 @@ class AudioService:
                 ("start", (chat_id, media_path), {}),
                 ("start", (), {"chat_id": chat_id, "source": media_path}),
                 ("start", (), {"chat_id": chat_id, "file": media_path}),
-            ],
+            ]
         )
 
     async def _backend_pause(self, chat_id: int) -> Any:
         return await self._call_variants(
-            self.calls,
             [
                 ("set_pause", (True,), {}),
                 ("pause", (chat_id,), {}),
                 ("pause", (), {"chat_id": chat_id}),
                 ("pause_playout", (chat_id,), {}),
                 ("pause_playout", (), {"chat_id": chat_id}),
-            ],
+            ]
         )
 
     async def _backend_resume(self, chat_id: int) -> Any:
         return await self._call_variants(
-            self.calls,
             [
                 ("set_pause", (False,), {}),
                 ("resume", (chat_id,), {}),
                 ("resume", (), {"chat_id": chat_id}),
                 ("resume_playout", (chat_id,), {}),
                 ("resume_playout", (), {"chat_id": chat_id}),
-            ],
+            ]
         )
 
-    async def _backend_stop(self, chat_id: int) -> Any:
+    async def _backend_leave(self, chat_id: int) -> Any:
         return await self._call_variants(
-            self.calls,
             [
                 ("leave_current_group_call", (), {}),
                 ("leave_current_group_call", (chat_id,), {}),
@@ -218,6 +232,12 @@ class AudioService:
                 ("leave_group_call", (chat_id,), {}),
                 ("leave", (), {}),
                 ("leave", (chat_id,), {}),
+            ]
+        )
+
+    async def _backend_stop(self, chat_id: int) -> Any:
+        return await self._call_variants(
+            [
                 ("stop_stream", (chat_id,), {}),
                 ("stop_stream", (), {"chat_id": chat_id}),
                 ("stop_playout", (), {}),
@@ -226,7 +246,7 @@ class AudioService:
                 ("stop", (chat_id,), {}),
                 ("stop", (), {"chat_id": chat_id}),
                 ("stop", (), {}),
-            ],
+            ]
         )
 
     def _session(self, chat_id: int) -> AudioSession:
@@ -415,11 +435,13 @@ class AudioService:
                 "elapsed": 0,
                 "remaining": 0,
             }
+
         elapsed = 0
         if s.status == "playing":
             elapsed = max(0, int(time.time() - s.started_at - s.paused_seconds))
         elif s.status == "paused" and s.pause_started_at:
             elapsed = max(0, int(s.pause_started_at - s.started_at - s.paused_seconds))
+
         remaining = max(0, int(s.current_expected_duration - elapsed)) if s.current_expected_duration else 0
         return {
             "ok": True,
@@ -502,6 +524,10 @@ class AudioService:
         session = self._session(chat_id)
 
         if session.status in {"playing", "paused"}:
+            try:
+                await self._backend_leave(chat_id)
+            except Exception:
+                pass
             try:
                 await self._backend_stop(chat_id)
             except Exception:
@@ -599,15 +625,31 @@ class AudioService:
 
         async with self._lock:
             self._cancel_auto(chat_id)
+
+            leave_err = stop_err = None
+            leave_ok = stop_ok = False
+
+            try:
+                await self._backend_leave(chat_id)
+                leave_ok = True
+            except Exception as exc:
+                leave_err = exc
+
             try:
                 await self._backend_stop(chat_id)
+                stop_ok = True
             except Exception as exc:
+                stop_err = exc
+
+            if not (leave_ok or stop_ok):
                 s = self._session(chat_id)
-                s.last_error = f"{type(exc).__name__}: {exc}"
+                s.last_error = f"{type((leave_err or stop_err)).__name__}: {leave_err or stop_err}"
                 s.status = "error"
                 s.last_update_at = time.time()
                 logger.exception("audio backend stop failed", extra={"chat_id": chat_id})
-                raise RuntimeError(f"backend_stop_failed: {type(exc).__name__}: {exc}") from exc
+                raise RuntimeError(
+                    f"backend_stop_failed: {type((leave_err or stop_err)).__name__}: {leave_err or stop_err}"
+                ) from (leave_err or stop_err)
 
             self._sessions.pop(chat_id, None)
             return {
@@ -638,13 +680,20 @@ class AudioService:
             base = s.current.local_path or s.current.source_id
             if not Path(base).exists():
                 raise RuntimeError("seek_requires_local_source")
+
             new_offset = max(0, int(s.current_offset + int(delta)))
             s.current_offset = new_offset
             self._cancel_auto(chat_id)
+
+            try:
+                await self._backend_leave(chat_id)
+            except Exception:
+                pass
             try:
                 await self._backend_stop(chat_id)
             except Exception:
                 pass
+
             s.started_at = time.time()
             s.pause_started_at = 0.0
             s.paused_seconds = 0.0
@@ -653,12 +702,14 @@ class AudioService:
             s.current_play_path = self._trim_media(base, new_offset) if new_offset > 0 else base
             if s.current.duration:
                 s.current_expected_duration = max(0, s.current.duration - new_offset)
+
             try:
                 await self._backend_play(chat_id, s.current_play_path)
             except Exception as exc:
                 s.status = "error"
                 s.last_error = f"{type(exc).__name__}: {exc}"
                 raise
+
             self._schedule_auto_advance(chat_id)
             return self._state(chat_id)
 
@@ -721,13 +772,19 @@ class AudioService:
         async with self._lock:
             self._cancel_auto(chat_id)
             try:
+                await self._backend_leave(chat_id)
+            except Exception:
+                pass
+            try:
                 await self._backend_stop(chat_id)
             except Exception:
                 pass
+
             q = self._queue(chat_id)
             if q:
                 next_item = q.pop(0)
                 return await self._start_item_locked(chat_id, next_item, offset=0)
+
             self._sessions.pop(chat_id, None)
             return {
                 "ok": True,
@@ -747,6 +804,11 @@ class AudioService:
 
     def state(self, chat_id: int) -> dict[str, Any]:
         return self._state(chat_id)
+
+    async def status(self, chat_id: int) -> dict[str, Any]:
+        return self._state(chat_id)
+
+    get_state = status
 
 
 service = AudioService()
