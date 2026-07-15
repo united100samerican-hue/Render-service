@@ -1,47 +1,58 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import logging
 import os
-import subprocess
 import tempfile
 import time
-import uuid
+from collections import deque
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
 import httpx
 from pydantic import BaseModel, Field
-from telethon import TelegramClient
-from telethon.sessions import StringSession
+
+logger = logging.getLogger("audio_service")
+
+try:
+    from telethon import TelegramClient
+    from telethon.sessions import StringSession
+except Exception as exc:  # pragma: no cover
+    TelegramClient = None  # type: ignore[assignment]
+    StringSession = None  # type: ignore[assignment]
+    TELETHON_IMPORT_ERROR = str(exc)
+else:
+    TELETHON_IMPORT_ERROR = ""
 
 try:
     from pytgcalls import PyTgCalls
-    PYTGCALLS_IMPORT_ERROR = ""
 except Exception:
     try:
         from py_tgcalls import PyTgCalls  # type: ignore
-        PYTGCALLS_IMPORT_ERROR = ""
-    except Exception as exc:
-        PyTgCalls = None
+    except Exception as exc:  # pragma: no cover
+        PyTgCalls = None  # type: ignore[assignment]
         PYTGCALLS_IMPORT_ERROR = str(exc)
-
-logger = logging.getLogger("audio_service")
+    else:
+        PYTGCALLS_IMPORT_ERROR = ""
+else:
+    PYTGCALLS_IMPORT_ERROR = ""
 
 SESSION_STRING = os.getenv("SESSION_STRING", "").strip()
 API_ID = int(os.getenv("API_ID", "0") or 0)
 API_HASH = os.getenv("API_HASH", "").strip()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+USER_AGENT = "RenderAudioService/4.0"
 
-USER_AGENT = "RenderAudioService/2.2"
-TMP_ROOT = Path(os.getenv("AUDIO_TMP_ROOT", "/tmp/audio-service")).resolve()
-TMP_ROOT.mkdir(parents=True, exist_ok=True)
+MISSING_ENV = [name for name, value in (
+    ("SESSION_STRING", SESSION_STRING),
+    ("API_ID", str(API_ID) if API_ID else ""),
+    ("API_HASH", API_HASH),
+) if not value]
 
 
 class MetaRequest(BaseModel):
-    chat_id: int = Field(...)
+    chat_id: int = Field(..., description="Telegram chat id")
     source_type: str = Field(default="url")
     source_id: str = Field(default="")
     title: str = Field(default="")
@@ -85,54 +96,48 @@ class QueueClearRequest(BaseModel):
 
 
 @dataclass
-class QueueItem:
-    id: str
+class AudioSession:
     chat_id: int
     source_type: str = "url"
     source_id: str = ""
     title: str = ""
     duration: int = 0
-    requested_by: str = ""
-    created_at: float = 0.0
+    status: str = "idle"
+    paused: bool = False
+    started_at: float = 0.0
+    updated_at: float = 0.0
+    last_error: str = ""
     local_path: str = ""
-    offset: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
 @dataclass
-class AudioSession:
+class QueueItem:
     chat_id: int
-    status: str = "idle"
-    paused: bool = False
-    started_at: float = 0.0
-    pause_started_at: float = 0.0
-    paused_seconds: float = 0.0
-    last_error: str = ""
-    current: Optional[QueueItem] = None
-    current_play_path: str = ""
-    current_expected_duration: int = 0
-    current_offset: int = 0
-    last_update_at: float = 0.0
-    auto_task: Optional[asyncio.Task] = field(default=None, repr=False, compare=False)
+    source_type: str
+    source_id: str
+    title: str = ""
+    duration: int = 0
+    requested_by: str = ""
+    auto_start: bool = True
+    enqueued_at: float = field(default_factory=time.time)
 
     def to_dict(self) -> dict[str, Any]:
-        data = asdict(self)
-        data["current"] = self.current.to_dict() if self.current else None
-        data.pop("auto_task", None)
-        return data
+        return asdict(self)
 
 
 class AudioService:
     def __init__(self) -> None:
         self.ready: bool = False
         self.backend_error: str = ""
-        self.client: Optional[TelegramClient] = None
-        self.calls: Any = None
+        self.client: Optional[Any] = None
+        self.calls: Optional[Any] = None
         self._lock = asyncio.Lock()
         self._sessions: dict[int, AudioSession] = {}
-        self._queues: dict[int, list[QueueItem]] = {}
+        self._queues: dict[int, deque[QueueItem]] = {}
+        self._state_file: Path | None = None
 
     def active_sessions_count(self) -> int:
         return sum(1 for s in self._sessions.values() if s.status in {"playing", "paused"})
@@ -140,675 +145,356 @@ class AudioService:
     def queues_count(self) -> int:
         return sum(len(q) for q in self._queues.values())
 
+    def _queue(self, chat_id: int) -> deque[QueueItem]:
+        q = self._queues.get(chat_id)
+        if q is None:
+            q = deque()
+            self._queues[chat_id] = q
+        return q
+
+    def state(self, chat_id: int) -> dict[str, Any]:
+        s = self._sessions.get(chat_id) or AudioSession(chat_id=chat_id)
+        q = self._queues.get(chat_id) or deque()
+        return {
+            "ok": True,
+            "chat_id": chat_id,
+            "ready": self.ready,
+            "backend_error": self.backend_error,
+            "session": s.to_dict(),
+            "queue_length": len(q),
+            "queue_head": q[0].to_dict() if q else None,
+        }
+
     def _env_ok(self) -> tuple[bool, str]:
-        missing: list[str] = []
-        if not SESSION_STRING:
-            missing.append("SESSION_STRING")
-        if not API_ID:
-            missing.append("API_ID")
-        if not API_HASH:
-            missing.append("API_HASH")
-        return (False, "missing_env: " + ", ".join(missing)) if missing else (True, "")
+        if MISSING_ENV:
+            return False, "missing_env: " + ", ".join(MISSING_ENV)
+        return True, ""
 
     async def _maybe_await(self, value: Any) -> Any:
-        return await value if inspect.isawaitable(value) else value
+        if asyncio.iscoroutine(value) or asyncio.isfuture(value):
+            return await value
+        return value
 
-    def _backend_targets(self) -> list[Any]:
-        targets: list[Any] = []
-        for obj in (
-            self.calls,
-            getattr(self.calls, "group_call", None),
-            getattr(self.calls, "_group_call", None),
-        ):
-            if obj and obj not in targets:
-                targets.append(obj)
-        return targets
-
-    async def _call_variants(
-        self,
-        candidates: list[tuple[str, tuple[Any, ...], dict[str, Any]]],
-        targets: Optional[list[Any]] = None,
-    ) -> Any:
-        targets = targets or self._backend_targets()
-        if not targets:
-            raise RuntimeError("backend_not_ready")
-
-        last_exc: Exception | None = None
-        for target in targets:
-            for name, args, kwargs in candidates:
-                fn = getattr(target, name, None)
-                if not callable(fn):
-                    continue
-                try:
-                    return await self._maybe_await(fn(*args, **kwargs))
-                except Exception as exc:
-                    last_exc = exc
-
-        if last_exc:
-            raise last_exc
-        raise RuntimeError("method_not_supported")
-
-    async def _backend_play(self, chat_id: int, media_path: str) -> Any:
-        return await self._call_variants(
-            [
-                ("play", (chat_id, media_path), {}),
-                ("play", (), {"chat_id": chat_id, "source": media_path}),
-                ("play", (), {"chat_id": chat_id, "file": media_path}),
-                ("play", (), {"chat_id": chat_id, "media": media_path}),
-                ("start", (chat_id, media_path), {}),
-                ("start", (), {"chat_id": chat_id, "source": media_path}),
-                ("start", (), {"chat_id": chat_id, "file": media_path}),
-            ]
-        )
-
-    async def _backend_pause(self, chat_id: int) -> Any:
-        return await self._call_variants(
-            [
-                ("set_pause", (True,), {}),
-                ("pause", (chat_id,), {}),
-                ("pause", (), {"chat_id": chat_id}),
-                ("pause_playout", (chat_id,), {}),
-                ("pause_playout", (), {"chat_id": chat_id}),
-            ]
-        )
-
-    async def _backend_resume(self, chat_id: int) -> Any:
-        return await self._call_variants(
-            [
-                ("set_pause", (False,), {}),
-                ("resume", (chat_id,), {}),
-                ("resume", (), {"chat_id": chat_id}),
-                ("resume_playout", (chat_id,), {}),
-                ("resume_playout", (), {"chat_id": chat_id}),
-            ]
-        )
-
-    async def _backend_leave(self, chat_id: int) -> Any:
-        return await self._call_variants(
-            [
-                ("leave_current_group_call", (), {}),
-                ("leave_current_group_call", (chat_id,), {}),
-                ("leave_group_call", (), {}),
-                ("leave_group_call", (chat_id,), {}),
-                ("leave", (), {}),
-                ("leave", (chat_id,), {}),
-            ]
-        )
-
-    async def _backend_stop(self, chat_id: int) -> Any:
-        return await self._call_variants(
-            [
-                ("stop_stream", (chat_id,), {}),
-                ("stop_stream", (), {"chat_id": chat_id}),
-                ("stop_playout", (), {}),
-                ("stop_media", (), {}),
-                ("stop_audio", (), {}),
-                ("stop", (chat_id,), {}),
-                ("stop", (), {"chat_id": chat_id}),
-                ("stop", (), {}),
-            ]
-        )
-
-    def _session(self, chat_id: int) -> AudioSession:
-        s = self._sessions.get(chat_id)
-        if not s:
-            s = AudioSession(chat_id=chat_id)
-            self._sessions[chat_id] = s
-        return s
-
-    def _queue(self, chat_id: int) -> list[QueueItem]:
-        return self._queues.setdefault(chat_id, [])
-
-    def _probe_duration(self, path: str) -> int:
-        try:
-            cp = subprocess.run(
-                [
-                    "ffprobe",
-                    "-v",
-                    "error",
-                    "-show_entries",
-                    "format=duration",
-                    "-of",
-                    "default=noprint_wrappers=1:nokey=1",
-                    path,
-                ],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            return max(0, int(float((cp.stdout or "0").strip() or 0)))
-        except Exception:
-            return 0
-
-    def _make_temp_path(self, suffix: str) -> Path:
-        fd, raw = tempfile.mkstemp(prefix="audio_", suffix=suffix, dir=str(TMP_ROOT))
-        os.close(fd)
-        return Path(raw)
-
-    def _normalize_source(self, source_type: str, source_id: str) -> str:
-        src = str(source_id or "").strip()
-        if not src:
-            raise ValueError("source_id_required")
-
-        if src.startswith(("http://", "https://")):
-            return src
-
-        st = str(source_type or "").lower().strip()
-        if st in {"file", "path", "local"}:
-            p = Path(src).expanduser()
-            if not p.exists():
-                raise ValueError(f"file_not_found: {src}")
-            return str(p.resolve())
-
-        p = Path(src).expanduser()
-        if p.exists():
-            return str(p.resolve())
-
-        return src
-
-    async def _stream_download_url(self, url: str) -> str:
-        ext = Path(url.split("?", 1)[0]).suffix or ".bin"
-        out = self._make_temp_path(ext)
-        timeout = httpx.Timeout(30.0, connect=30.0, read=None, write=30.0, pool=30.0)
-        async with httpx.AsyncClient(timeout=timeout, headers={"User-Agent": USER_AGENT}, follow_redirects=True) as client:
-            async with client.stream("GET", url) as r:
-                r.raise_for_status()
-                with open(out, "wb") as f:
-                    async for chunk in r.aiter_bytes(256 * 1024):
-                        if chunk:
-                            f.write(chunk)
-        return str(out)
+    async def _call_any(self, obj: Any, method_names: list[str], *args: Any, **kwargs: Any) -> bool:
+        if not obj:
+            return False
+        for name in method_names:
+            fn = getattr(obj, name, None)
+            if not callable(fn):
+                continue
+            try:
+                await self._maybe_await(fn(*args, **kwargs))
+                return True
+            except TypeError:
+                # try the next variant
+                continue
+            except Exception as exc:
+                logger.debug("backend call %s failed: %s", name, exc)
+                continue
+        return False
 
     async def _download_via_bot_api(self, file_id: str) -> str:
         if not BOT_TOKEN:
             raise RuntimeError("BOT_TOKEN missing")
-
-        timeout = httpx.Timeout(30.0, connect=30.0, read=None, write=30.0, pool=30.0)
-        async with httpx.AsyncClient(timeout=timeout, headers={"User-Agent": USER_AGENT}) as client:
-            r = await client.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getFile", params={"file_id": file_id})
+        async with httpx.AsyncClient(timeout=120, headers={"User-Agent": USER_AGENT}) as client:
+            r = await client.get(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/getFile",
+                params={"file_id": file_id},
+            )
+            r.raise_for_status()
             j = r.json()
             if not j.get("ok"):
                 raise RuntimeError(j.get("description") or "getFile_failed")
             file_path = j["result"]["file_path"]
-            ext = Path(file_path).suffix or ".bin"
-            out = self._make_temp_path(ext)
-            async with client.stream("GET", f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}") as dl:
-                dl.raise_for_status()
-                with open(out, "wb") as f:
-                    async for chunk in dl.aiter_bytes(256 * 1024):
-                        if chunk:
-                            f.write(chunk)
-        return str(out)
+            dl = await client.get(f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}")
+            dl.raise_for_status()
+            suffix = Path(file_path).suffix or ".bin"
+            fd, out_path = tempfile.mkstemp(prefix="audio_", suffix=suffix)
+            os.close(fd)
+            with open(out_path, "wb") as f:
+                f.write(dl.content)
+            return out_path
+
+    def _normalize_source(self, source_type: str, source_id: str) -> tuple[str, str]:
+        st = (source_type or "url").strip().lower()
+        src = (source_id or "").strip()
+        if not src:
+            raise ValueError("source_id_required")
+        if st in {"file", "path", "local"}:
+            p = Path(src).expanduser()
+            if not p.exists():
+                raise ValueError(f"file_not_found: {src}")
+            return "file", str(p.resolve())
+        if st in {"file_id", "fileid", "telegram_file"}:
+            return "file_id", src
+        return "url", src
 
     async def _materialize_source(self, source_type: str, source_id: str) -> str:
-        src = self._normalize_source(source_type, source_id)
-
-        if src.startswith(("http://", "https://")):
-            return await self._stream_download_url(src)
-
-        p = Path(src)
-        if p.exists():
-            return str(p.resolve())
-
-        st = str(source_type or "").lower().strip()
-        if st in {"telegram", "tg", "telegram_file", "file_id"} or len(src) >= 20:
+        st, src = self._normalize_source(source_type, source_id)
+        if st == "file":
+            return src
+        if st == "file_id":
             return await self._download_via_bot_api(src)
-
         return src
 
-    def _trim_media(self, source_path: str, offset_seconds: int) -> str:
-        if offset_seconds <= 0:
-            return source_path
-        out = self._make_temp_path(".ogg")
-        subprocess.run(
-            [
-                "ffmpeg",
-                "-y",
-                "-ss",
-                str(max(0, int(offset_seconds))),
-                "-i",
-                source_path,
-                "-vn",
-                "-c:a",
-                "libopus",
-                "-b:a",
-                "128k",
-                str(out),
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=True,
-        )
-        return str(out)
-
-    def _cancel_auto(self, chat_id: int) -> None:
-        s = self._sessions.get(chat_id)
-        if not s or not s.auto_task:
+    async def _ensure_client(self) -> None:
+        if self.ready:
             return
-        if not s.auto_task.done():
-            s.auto_task.cancel()
-        s.auto_task = None
-
-    def _remaining_seconds(self, s: AudioSession) -> int:
-        if not s.current_expected_duration:
-            return 0
-        elapsed = max(0.0, time.time() - s.started_at - s.paused_seconds)
-        return max(0, int(s.current_expected_duration - elapsed))
-
-    async def _auto_advance(self, chat_id: int, seconds: int, current_id: str) -> None:
+        ok, why = self._env_ok()
+        if not ok:
+            self.backend_error = why
+            self.ready = False
+            return
+        if TelegramClient is None or PyTgCalls is None or StringSession is None:
+            self.ready = False
+            self.backend_error = f"import_error: telethon={TELETHON_IMPORT_ERROR or 'ok'}; pytgcalls={PYTGCALLS_IMPORT_ERROR or 'ok'}"
+            return
+        self.client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
         try:
-            await asyncio.sleep(max(1, seconds))
-            async with self._lock:
-                s = self._sessions.get(chat_id)
-                if not s or s.status != "playing" or not s.current or s.current.id != current_id:
-                    return
-            await self.skip(chat_id, _internal=True)
-        except asyncio.CancelledError:
-            return
-        except Exception:
-            logger.exception("auto_advance_failed", extra={"chat_id": chat_id})
-
-    def _schedule_auto_advance(self, chat_id: int) -> None:
-        s = self._sessions.get(chat_id)
-        if not s or not s.current or s.current_expected_duration <= 0:
-            return
-        self._cancel_auto(chat_id)
-        remaining = self._remaining_seconds(s)
-        if remaining <= 0:
-            return
-        s.auto_task = asyncio.create_task(self._auto_advance(chat_id, remaining, s.current.id))
-
-    def _state(self, chat_id: int) -> dict[str, Any]:
-        s = self._sessions.get(chat_id)
-        q = [item.to_dict() for item in self._queue(chat_id)]
-        if not s:
-            return {
-                "ok": True,
-                "ready": self.ready,
-                "playing": False,
-                "paused": False,
-                "chat_id": chat_id,
-                "current": None,
-                "queue": q,
-                "queue_size": len(q),
-                "last_error": "",
-                "elapsed": 0,
-                "remaining": 0,
-            }
-
-        elapsed = 0
-        if s.status == "playing":
-            elapsed = max(0, int(time.time() - s.started_at - s.paused_seconds))
-        elif s.status == "paused" and s.pause_started_at:
-            elapsed = max(0, int(s.pause_started_at - s.started_at - s.paused_seconds))
-
-        remaining = max(0, int(s.current_expected_duration - elapsed)) if s.current_expected_duration else 0
-        return {
-            "ok": True,
-            "ready": self.ready,
-            "playing": s.status == "playing",
-            "paused": s.status == "paused",
-            "chat_id": s.chat_id,
-            "current": s.current.to_dict() if s.current else None,
-            "queue": q,
-            "queue_size": len(q),
-            "last_error": s.last_error,
-            "elapsed": elapsed,
-            "remaining": remaining,
-            "status": s.status,
-            "offset": s.current_offset,
-        }
+            await self._maybe_await(self.client.start())
+            self.calls = PyTgCalls(self.client)
+            await self._maybe_await(self.calls.start())
+            self.ready = True
+            self.backend_error = ""
+            logger.info("audio service ready")
+        except Exception as exc:
+            self.ready = False
+            self.backend_error = str(exc)
+            logger.exception("audio init failed")
+            try:
+                if self.client:
+                    await self._maybe_await(self.client.disconnect())
+            except Exception:
+                pass
 
     async def ensure_ready(self) -> None:
-        async with self._lock:
-            if self.ready:
-                return
+        await self._ensure_client()
 
-            ok, reason = self._env_ok()
-            if not ok:
-                self.backend_error = reason
-                self.ready = False
-                logger.error("audio env missing: %s", reason)
-                return
-
-            if PyTgCalls is None:
-                self.backend_error = f"pytgcalls_import_error: {PYTGCALLS_IMPORT_ERROR}"
-                self.ready = False
-                logger.error("audio backend import failed: %s", self.backend_error)
-                return
-
-            try:
-                self.client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
-                await self._maybe_await(self.client.start())
-
-                self.calls = PyTgCalls(self.client)
-                await self._maybe_await(self.calls.start())
-
-                self.ready = True
-                self.backend_error = ""
-                logger.info("audio service ready")
-            except Exception as exc:
-                self.ready = False
-                self.backend_error = str(exc)
-                logger.exception("audio init failed")
-                try:
-                    if self.client:
-                        await self._maybe_await(self.client.disconnect())
-                except Exception:
-                    pass
-                self.client = None
-                self.calls = None
+    def _touch(self, s: AudioSession) -> AudioSession:
+        s.updated_at = time.time()
+        return s
 
     async def meta(self, payload: MetaRequest) -> dict[str, Any]:
-        async with self._lock:
-            s = self._session(payload.chat_id)
-            if not s.current:
-                s.current = QueueItem(
-                    id=uuid.uuid4().hex,
-                    chat_id=payload.chat_id,
-                    source_type=payload.source_type,
-                    source_id=payload.source_id,
-                    title=payload.title,
-                    duration=int(payload.duration or 0),
-                    created_at=time.time(),
-                )
-            s.current.source_type = payload.source_type
-            s.current.source_id = payload.source_id
-            s.current.title = payload.title
-            s.current.duration = int(payload.duration or 0)
-            s.last_update_at = time.time()
-            return self._state(payload.chat_id)
-
-    async def _start_item_locked(self, chat_id: int, item: QueueItem, offset: int = 0) -> dict[str, Any]:
-        self._cancel_auto(chat_id)
-        session = self._session(chat_id)
-
-        if session.status in {"playing", "paused"}:
-            try:
-                await self._backend_leave(chat_id)
-            except Exception:
-                pass
-            try:
-                await self._backend_stop(chat_id)
-            except Exception:
-                pass
-
-        source = item.local_path or await self._materialize_source(item.source_type, item.source_id)
-        item.local_path = source
-        item.offset = max(0, int(offset))
-        play_path = self._trim_media(source, item.offset) if item.offset > 0 else source
-        expected_duration = max(0, item.duration - item.offset) if item.duration else 0
-
-        session.current = item
-        session.current_play_path = play_path
-        session.current_expected_duration = expected_duration
-        session.current_offset = item.offset
-        session.started_at = time.time()
-        session.pause_started_at = 0.0
-        session.paused_seconds = 0.0
-        session.status = "playing"
-        session.paused = False
-        session.last_error = ""
-        session.last_update_at = time.time()
-
-        try:
-            await self._backend_play(chat_id, play_path)
-        except Exception as exc:
-            session.status = "error"
-            session.last_error = f"{type(exc).__name__}: {exc}"
-            raise
-
-        self._schedule_auto_advance(chat_id)
-        return self._state(chat_id)
+        s = self._sessions.get(payload.chat_id) or AudioSession(chat_id=payload.chat_id)
+        s.source_type = payload.source_type
+        s.source_id = payload.source_id
+        s.title = payload.title
+        s.duration = payload.duration
+        self._sessions[payload.chat_id] = self._touch(s)
+        return {"ok": True, "action": "meta", "state": self.state(payload.chat_id)}
 
     async def start(self, payload: StartRequest) -> dict[str, Any]:
         await self.ensure_ready()
-        if not self.ready:
-            raise RuntimeError(f"service_not_ready: {self.backend_error or 'missing_env'}")
+        s = self._sessions.get(payload.chat_id) or AudioSession(chat_id=payload.chat_id)
+        s.source_type = payload.source_type
+        s.source_id = payload.source_id
+        s.title = payload.title
+        s.duration = payload.duration
+        s.status = "starting"
+        s.paused = False
+        s.started_at = s.started_at or time.time()
+        s.last_error = ""
+        self._sessions[payload.chat_id] = self._touch(s)
 
-        async with self._lock:
+        if not self.ready:
+            s.status = "error"
+            s.last_error = self.backend_error or "service_not_ready"
+            self._sessions[payload.chat_id] = self._touch(s)
+            return {"ok": False, "action": "start", "error": "service_not_ready", "detail": self.backend_error, "state": self.state(payload.chat_id)}
+
+        try:
             source = await self._materialize_source(payload.source_type, payload.source_id)
-            item_duration = int(payload.duration or 0) or self._probe_duration(source)
-            item = QueueItem(
-                id=uuid.uuid4().hex,
-                chat_id=payload.chat_id,
-                source_type=payload.source_type,
-                source_id=source,
-                title=payload.title,
-                duration=item_duration,
-                created_at=time.time(),
-                local_path=source,
-                offset=max(0, int(payload.offset or 0)),
-            )
-            return await self._start_item_locked(payload.chat_id, item, offset=item.offset)
+            s.local_path = source if Path(source).exists() else ""
+            self._sessions[payload.chat_id] = self._touch(s)
+
+            # Try common call/play variants without failing the whole request.
+            played = False
+            if self.calls:
+                played = await self._call_any(
+                    self.calls,
+                    [
+                        "play",
+                        "start",
+                        "join",
+                        "join_group_call",
+                        "create",
+                    ],
+                    payload.chat_id,
+                    source,
+                    title=payload.title,
+                    duration=payload.duration,
+                    offset=payload.offset,
+                )
+                if not played:
+                    played = await self._call_any(
+                        self.calls,
+                        [
+                            "play",
+                            "start",
+                            "join",
+                            "join_group_call",
+                        ],
+                        payload.chat_id,
+                        source,
+                    )
+
+            s.status = "playing" if played else "idle"
+            s.paused = False
+            s.last_error = "" if played else "backend_start_noop"
+            self._sessions[payload.chat_id] = self._touch(s)
+            return {"ok": True, "action": "start", "played": played, "state": self.state(payload.chat_id)}
+        except Exception as exc:
+            s.status = "error"
+            s.last_error = f"{type(exc).__name__}: {exc}"
+            self._sessions[payload.chat_id] = self._touch(s)
+            return {"ok": False, "action": "start", "error": type(exc).__name__, "detail": str(exc), "state": self.state(payload.chat_id)}
 
     async def pause(self, chat_id: int) -> dict[str, Any]:
         await self.ensure_ready()
+        s = self._sessions.get(chat_id) or AudioSession(chat_id=chat_id)
         if not self.ready:
-            raise RuntimeError(f"service_not_ready: {self.backend_error or 'missing_env'}")
+            s.status = "error"
+            s.last_error = self.backend_error or "service_not_ready"
+            self._sessions[chat_id] = self._touch(s)
+            return {"ok": False, "action": "pause", "error": "service_not_ready", "detail": self.backend_error, "state": self.state(chat_id)}
 
-        async with self._lock:
-            s = self._session(chat_id)
-            if s.status != "playing":
-                return self._state(chat_id)
-            await self._backend_pause(chat_id)
-            self._cancel_auto(chat_id)
-            s.status = "paused"
-            s.paused = True
-            s.pause_started_at = time.time()
-            s.last_update_at = time.time()
-            return self._state(chat_id)
+        try:
+            paused = await self._call_any(self.calls, ["pause", "pause_stream"], chat_id) if self.calls else False
+            s.status = "paused" if paused else s.status
+            s.paused = True if paused else s.paused
+            self._sessions[chat_id] = self._touch(s)
+            return {"ok": True, "action": "pause", "paused": paused, "state": self.state(chat_id)}
+        except Exception as exc:
+            s.status = "error"
+            s.last_error = f"{type(exc).__name__}: {exc}"
+            self._sessions[chat_id] = self._touch(s)
+            return {"ok": False, "action": "pause", "error": type(exc).__name__, "detail": str(exc), "state": self.state(chat_id)}
 
     async def resume(self, chat_id: int) -> dict[str, Any]:
         await self.ensure_ready()
+        s = self._sessions.get(chat_id) or AudioSession(chat_id=chat_id)
         if not self.ready:
-            raise RuntimeError(f"service_not_ready: {self.backend_error or 'missing_env'}")
+            s.status = "error"
+            s.last_error = self.backend_error or "service_not_ready"
+            self._sessions[chat_id] = self._touch(s)
+            return {"ok": False, "action": "resume", "error": "service_not_ready", "detail": self.backend_error, "state": self.state(chat_id)}
 
-        async with self._lock:
-            s = self._session(chat_id)
-            if s.status != "paused":
-                return self._state(chat_id)
-            await self._backend_resume(chat_id)
-            if s.pause_started_at:
-                s.paused_seconds += max(0.0, time.time() - s.pause_started_at)
-                s.pause_started_at = 0.0
-            s.status = "playing"
-            s.paused = False
-            s.last_update_at = time.time()
-            self._schedule_auto_advance(chat_id)
-            return self._state(chat_id)
+        try:
+            resumed = await self._call_any(self.calls, ["resume", "resume_stream"], chat_id) if self.calls else False
+            s.status = "playing" if resumed else s.status
+            s.paused = False if resumed else s.paused
+            self._sessions[chat_id] = self._touch(s)
+            return {"ok": True, "action": "resume", "resumed": resumed, "state": self.state(chat_id)}
+        except Exception as exc:
+            s.status = "error"
+            s.last_error = f"{type(exc).__name__}: {exc}"
+            self._sessions[chat_id] = self._touch(s)
+            return {"ok": False, "action": "resume", "error": type(exc).__name__, "detail": str(exc), "state": self.state(chat_id)}
+
+    async def _stop_backend(self, chat_id: int) -> bool:
+        # Try the widest set of known method names first.
+        if await self._call_any(self.calls, ["stop", "leave_current_group_call", "leave_group_call", "leave", "stop_stream"], chat_id):
+            return True
+
+        # Last resort: disconnect the client so the session definitely ends.
+        if self.client:
+            try:
+                await self._maybe_await(self.client.disconnect())
+                return True
+            except Exception as exc:
+                logger.debug("client disconnect fallback failed: %s", exc)
+        return False
 
     async def stop(self, chat_id: int) -> dict[str, Any]:
         await self.ensure_ready()
+        s = self._sessions.get(chat_id) or AudioSession(chat_id=chat_id)
+
+        # Even if the backend is not ready, we still return a clean response.
         if not self.ready:
-            raise RuntimeError(f"service_not_ready: {self.backend_error or 'missing_env'}")
-
-        async with self._lock:
-            self._cancel_auto(chat_id)
-
-            leave_err = stop_err = None
-            leave_ok = stop_ok = False
-
-            try:
-                await self._backend_leave(chat_id)
-                leave_ok = True
-            except Exception as exc:
-                leave_err = exc
-
-            try:
-                await self._backend_stop(chat_id)
-                stop_ok = True
-            except Exception as exc:
-                stop_err = exc
-
-            if not (leave_ok or stop_ok):
-                s = self._session(chat_id)
-                s.last_error = f"{type((leave_err or stop_err)).__name__}: {leave_err or stop_err}"
-                s.status = "error"
-                s.last_update_at = time.time()
-                logger.exception("audio backend stop failed", extra={"chat_id": chat_id})
-                raise RuntimeError(
-                    f"backend_stop_failed: {type((leave_err or stop_err)).__name__}: {leave_err or stop_err}"
-                ) from (leave_err or stop_err)
-
+            s.status = "stopped"
+            s.paused = False
+            s.last_error = self.backend_error or "service_not_ready"
             self._sessions.pop(chat_id, None)
-            return {
-                "ok": True,
-                "ready": self.ready,
-                "playing": False,
-                "paused": False,
-                "chat_id": chat_id,
-                "current": None,
-                "queue": [i.to_dict() for i in self._queue(chat_id)],
-                "queue_size": len(self._queue(chat_id)),
-                "last_error": "",
-                "elapsed": 0,
-                "remaining": 0,
-                "status": "stopped",
-                "offset": 0,
-            }
+            return {"ok": False, "action": "stop", "error": "service_not_ready", "detail": self.backend_error, "state": self.state(chat_id)}
+
+        try:
+            async with self._lock:
+                backend_stopped = await self._stop_backend(chat_id)
+                s.status = "stopped"
+                s.paused = False
+                s.last_error = "" if backend_stopped else "backend_stop_noop"
+                self._sessions.pop(chat_id, None)
+                self._queues.pop(chat_id, None)
+                return {"ok": True, "action": "stop", "stopped": backend_stopped, "state": self.state(chat_id)}
+        except Exception as exc:
+            # Never let /stop explode into a 500.
+            s.status = "stopped"
+            s.paused = False
+            s.last_error = f"{type(exc).__name__}: {exc}"
+            self._sessions.pop(chat_id, None)
+            self._queues.pop(chat_id, None)
+            return {"ok": False, "action": "stop", "error": type(exc).__name__, "detail": str(exc), "state": self.state(chat_id)}
 
     async def seek(self, chat_id: int, delta: int) -> dict[str, Any]:
         await self.ensure_ready()
         if not self.ready:
-            raise RuntimeError(f"service_not_ready: {self.backend_error or 'missing_env'}")
-
-        async with self._lock:
-            s = self._session(chat_id)
-            if not s.current:
-                raise RuntimeError("no_active_track")
-            base = s.current.local_path or s.current.source_id
-            if not Path(base).exists():
-                raise RuntimeError("seek_requires_local_source")
-
-            new_offset = max(0, int(s.current_offset + int(delta)))
-            s.current_offset = new_offset
-            self._cancel_auto(chat_id)
-
-            try:
-                await self._backend_leave(chat_id)
-            except Exception:
-                pass
-            try:
-                await self._backend_stop(chat_id)
-            except Exception:
-                pass
-
-            s.started_at = time.time()
-            s.pause_started_at = 0.0
-            s.paused_seconds = 0.0
-            s.status = "playing"
-            s.paused = False
-            s.current_play_path = self._trim_media(base, new_offset) if new_offset > 0 else base
-            if s.current.duration:
-                s.current_expected_duration = max(0, s.current.duration - new_offset)
-
-            try:
-                await self._backend_play(chat_id, s.current_play_path)
-            except Exception as exc:
-                s.status = "error"
-                s.last_error = f"{type(exc).__name__}: {exc}"
-                raise
-
-            self._schedule_auto_advance(chat_id)
-            return self._state(chat_id)
+            return {"ok": False, "action": "seek", "error": "service_not_ready", "detail": self.backend_error, "state": self.state(chat_id)}
+        try:
+            if not self.calls:
+                return {"ok": False, "action": "seek", "error": "calls_not_ready", "state": self.state(chat_id)}
+            fn = getattr(self.calls, "seek", None)
+            if not callable(fn):
+                return {"ok": False, "action": "seek", "error": "method_not_supported", "state": self.state(chat_id)}
+            await self._maybe_await(fn(chat_id, delta))
+            return {"ok": True, "action": "seek", "state": self.state(chat_id)}
+        except Exception as exc:
+            return {"ok": False, "action": "seek", "error": type(exc).__name__, "detail": str(exc), "state": self.state(chat_id)}
 
     async def enqueue(self, payload: QueueAddRequest) -> dict[str, Any]:
-        await self.ensure_ready()
-        if not self.ready:
-            raise RuntimeError(f"service_not_ready: {self.backend_error or 'missing_env'}")
-
-        async with self._lock:
-            source = await self._materialize_source(payload.source_type, payload.source_id)
-            duration = int(payload.duration or 0) or self._probe_duration(source)
-            item = QueueItem(
-                id=uuid.uuid4().hex,
+        item = QueueItem(
+            chat_id=payload.chat_id,
+            source_type=payload.source_type,
+            source_id=payload.source_id,
+            title=payload.title,
+            duration=payload.duration,
+            requested_by=payload.requested_by,
+            auto_start=payload.auto_start,
+        )
+        q = self._queue(payload.chat_id)
+        q.append(item)
+        self._sessions[payload.chat_id] = self._touch(self._sessions.get(payload.chat_id) or AudioSession(chat_id=payload.chat_id))
+        if payload.auto_start and self.state(payload.chat_id)["session"]["status"] in {"idle", "stopped"}:
+            start_res = await self.start(StartRequest(
                 chat_id=payload.chat_id,
                 source_type=payload.source_type,
-                source_id=source,
+                source_id=payload.source_id,
                 title=payload.title,
-                duration=duration,
-                requested_by=payload.requested_by,
-                created_at=time.time(),
-                local_path=source,
-            )
-            self._queue(payload.chat_id).append(item)
-            s = self._session(payload.chat_id)
-            if payload.auto_start and s.status not in {"playing", "paused"}:
-                next_item = self._queue(payload.chat_id).pop(0)
-                return await self._start_item_locked(payload.chat_id, next_item, offset=0)
-            return self._state(payload.chat_id)
+                duration=payload.duration,
+                offset=0,
+            ))
+            return {"ok": True, "action": "queue_add", "auto_started": True, "start_result": start_res, "state": self.state(payload.chat_id)}
+        return {"ok": True, "action": "queue_add", "queued": True, "queue_length": len(q), "state": self.state(payload.chat_id)}
 
     async def queue_list(self, chat_id: int) -> dict[str, Any]:
-        async with self._lock:
-            s = self._session(chat_id)
-            return {
-                "ok": True,
-                "ready": self.ready,
-                "chat_id": chat_id,
-                "current": s.current.to_dict() if s.current else None,
-                "queue": [i.to_dict() for i in self._queue(chat_id)],
-                "queue_size": len(self._queue(chat_id)),
-            }
+        q = self._queue(chat_id)
+        return {"ok": True, "action": "queue_list", "queue": [item.to_dict() for item in q], "state": self.state(chat_id)}
 
     async def queue_clear(self, chat_id: int) -> dict[str, Any]:
-        async with self._lock:
-            self._queues[chat_id] = []
-            s = self._session(chat_id)
-            return {
-                "ok": True,
-                "ready": self.ready,
-                "chat_id": chat_id,
-                "current": s.current.to_dict() if s.current else None,
-                "queue": [],
-                "queue_size": 0,
-            }
+        self._queues.pop(chat_id, None)
+        return {"ok": True, "action": "queue_clear", "state": self.state(chat_id)}
 
-    async def skip(self, chat_id: int, _internal: bool = False) -> dict[str, Any]:
-        await self.ensure_ready()
-        if not self.ready:
-            raise RuntimeError(f"service_not_ready: {self.backend_error or 'missing_env'}")
-
-        async with self._lock:
-            self._cancel_auto(chat_id)
-            try:
-                await self._backend_leave(chat_id)
-            except Exception:
-                pass
-            try:
-                await self._backend_stop(chat_id)
-            except Exception:
-                pass
-
-            q = self._queue(chat_id)
-            if q:
-                next_item = q.pop(0)
-                return await self._start_item_locked(chat_id, next_item, offset=0)
-
-            self._sessions.pop(chat_id, None)
-            return {
-                "ok": True,
-                "ready": self.ready,
-                "playing": False,
-                "paused": False,
-                "chat_id": chat_id,
-                "current": None,
-                "queue": [],
-                "queue_size": 0,
-                "last_error": "",
-                "elapsed": 0,
-                "remaining": 0,
-                "status": "stopped",
-                "offset": 0,
-            }
-
-    def state(self, chat_id: int) -> dict[str, Any]:
-        return self._state(chat_id)
-
-    async def status(self, chat_id: int) -> dict[str, Any]:
-        return self._state(chat_id)
-
-    get_state = status
-
-
-service = AudioService()
+    async def skip(self, chat_id: int) -> dict[str, Any]:
+        q = self._queue(chat_id)
+        if q:
+            q.popleft()
+        if not q:
+            return await self.stop(chat_id)
+        next_item = q[0]
+        return await self.start(StartRequest(
+            chat_id=chat_id,
+            source_type=next_item.source_type,
+            source_id=next_item.source_id,
+            title=next_item.title,
+            duration=next_item.duration,
+            offset=0,
+        ))
