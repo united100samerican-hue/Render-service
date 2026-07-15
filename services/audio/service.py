@@ -391,19 +391,39 @@ class AudioService:
             self._sessions[chat_id] = self._touch(s)
             return {"ok": False, "action": "resume", "error": type(exc).__name__, "detail": str(exc), "state": self.state(chat_id)}
 
-    async def _stop_backend(self, chat_id: int) -> bool:
-        # Try the widest set of known method names first.
-        if await self._call_any(self.calls, ["stop", "leave_current_group_call", "leave_group_call", "leave", "stop_stream"], chat_id):
-            return True
+    async def _stop_backend(self, chat_id: int) -> None:
+    if not self.calls:
+        raise RuntimeError("calls_not_ready")
 
-        # Last resort: disconnect the client so the session definitely ends.
-        if self.client:
-            try:
-                await self._maybe_await(self.client.disconnect())
-                return True
-            except Exception as exc:
-                logger.debug("client disconnect fallback failed: %s", exc)
-        return False
+    candidates: list[tuple[str, tuple[Any, ...]]] = [
+        ("leave_current_group_call", ()),
+        ("leave_group_call", ()),
+        ("leave_group_call", (int(chat_id),)),
+        ("leave", ()),
+        ("leave", (int(chat_id),)),
+        ("stop_stream", (int(chat_id),)),
+        ("stop", (int(chat_id),)),
+    ]
+
+    last_exc: Exception | None = None
+
+    for method_name, args in candidates:
+        fn = getattr(self.calls, method_name, None)
+        if not callable(fn):
+            continue
+        try:
+            await self._maybe_await(fn(*args))
+            return
+        except TypeError as exc:
+            last_exc = exc
+            continue
+        except Exception as exc:
+            last_exc = exc
+            continue
+
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("method_not_supported: stop")
 
     async def stop(self, chat_id: int) -> dict[str, Any]:
         await self.ensure_ready()
