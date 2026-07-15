@@ -19,7 +19,7 @@ from telethon.sessions import StringSession
 try:
     from pytgcalls import GroupCallFactory
 except Exception:
-    from pytgcalls.group_call_factory import GroupCallFactory  # type: ignore
+    from pytgcalls import GroupCallFactory  # type: ignore
 
 logger = logging.getLogger("audio_service")
 
