@@ -1,11 +1,10 @@
-
 from __future__ import annotations
 
 import logging
 import os
 from typing import Any
 
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, Request
 
 from service import AudioService, ControlRequest, MetaRequest, QueueAddRequest, SeekRequest, StartRequest, service
 
@@ -13,39 +12,40 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 logger = logging.getLogger("audio_app")
 
 app = FastAPI(title="Render Audio Service", version="5.0")
+
 KEEPALIVE_SECRET = os.getenv("KEEPALIVE_SECRET", "").strip()
 
 
 def _guard(secret: str | None) -> None:
     if KEEPALIVE_SECRET and (secret or "").strip() != KEEPALIVE_SECRET:
-        raise HTTPException(status_code=403, detail="forbidden")
+        raise RuntimeError("forbidden")
 
 
-def _coerce_int(value: Any, default: int = 0) -> int:
+def _coerce_int(v: Any, default: int = 0) -> int:
     try:
-        return int(value)
+        return int(v)
     except Exception:
         return default
 
 
 def _pick(body: dict[str, Any], *names: str, default: Any = None) -> Any:
-    for name in names:
-        if name in body and body[name] is not None:
-            return body[name]
+    for n in names:
+        if n in body and body[n] is not None:
+            return body[n]
     return default
 
 
-def _make_meta(body: dict[str, Any]) -> MetaRequest:
+def _meta(body: dict[str, Any]) -> MetaRequest:
     return MetaRequest(
         chat_id=_coerce_int(_pick(body, "chatId", "chat_id", default=0)),
-        source_type=str(_pick(body, "source_type", "sourceType", default="url")),
+        source_type=str(_pick(body, "source_type", "sourceType", default="telegram")),
         source_id=str(_pick(body, "source_id", "sourceId", default="")),
         title=str(_pick(body, "title", default="")),
         duration=_coerce_int(_pick(body, "duration", default=0)),
     )
 
 
-def _make_start(body: dict[str, Any]) -> StartRequest:
+def _start(body: dict[str, Any]) -> StartRequest:
     return StartRequest(
         chat_id=_coerce_int(_pick(body, "chatId", "chat_id", default=0)),
         source_type=str(_pick(body, "source_type", "sourceType", default="telegram")),
@@ -56,18 +56,18 @@ def _make_start(body: dict[str, Any]) -> StartRequest:
     )
 
 
-def _make_control(body: dict[str, Any]) -> ControlRequest:
+def _control(body: dict[str, Any]) -> ControlRequest:
     return ControlRequest(chat_id=_coerce_int(_pick(body, "chatId", "chat_id", default=0)))
 
 
-def _make_seek(body: dict[str, Any]) -> SeekRequest:
+def _seek(body: dict[str, Any]) -> SeekRequest:
     return SeekRequest(
         chat_id=_coerce_int(_pick(body, "chatId", "chat_id", default=0)),
         delta=_coerce_int(_pick(body, "delta", default=0)),
     )
 
 
-def _make_queue_add(body: dict[str, Any]) -> QueueAddRequest:
+def _queue(body: dict[str, Any]) -> QueueAddRequest:
     return QueueAddRequest(
         chat_id=_coerce_int(_pick(body, "chatId", "chat_id", default=0)),
         source_type=str(_pick(body, "source_type", "sourceType", default="telegram")),
@@ -81,11 +81,8 @@ def _make_queue_add(body: dict[str, Any]) -> QueueAddRequest:
 
 @app.on_event("startup")
 async def _startup() -> None:
-    try:
-        await service.ensure_ready()
-        logger.info("startup_done", extra={"ready": service.ready, "backend_error": service.backend_error})
-    except Exception:
-        logger.exception("audio startup failed")
+    await service.ensure_ready()
+    logger.info("startup_done", extra={"ready": service.ready, "backend_error": service.backend_error})
 
 
 @app.get("/")
@@ -112,83 +109,95 @@ async def health():
 @app.post("/meta")
 async def meta(req: Request, x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret")):
     _guard(x_keepalive_secret)
-    body = await req.json()
-    return await service.meta(_make_meta(body))
+    try:
+        return await service.meta(_meta(await req.json()))
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
 @app.post("/start")
 async def start(req: Request, x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret")):
     _guard(x_keepalive_secret)
-    body = await req.json()
     try:
-        return await service.start(_make_start(body))
+        return await service.start(_start(await req.json()))
     except Exception as e:
-        logger.exception("audio start failed", extra={"body": body})
-        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
 @app.post("/pause")
 async def pause(req: Request, x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret")):
     _guard(x_keepalive_secret)
-    body = await req.json()
-    return await service.pause(_make_control(body).chat_id)
+    try:
+        return await service.pause(_control(await req.json()).chat_id)
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
 @app.post("/resume")
 async def resume(req: Request, x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret")):
     _guard(x_keepalive_secret)
-    body = await req.json()
-    return await service.resume(_make_control(body).chat_id)
+    try:
+        return await service.resume(_control(await req.json()).chat_id)
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
 @app.post("/stop")
 async def stop(req: Request, x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret")):
     _guard(x_keepalive_secret)
-    body = await req.json()
-    return await service.stop(_make_control(body).chat_id)
+    try:
+        return await service.stop(_control(await req.json()).chat_id)
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
 @app.post("/seek")
 async def seek(req: Request, x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret")):
     _guard(x_keepalive_secret)
-    body = await req.json()
-    seek_req = _make_seek(body)
-    return await service.seek(seek_req.chat_id, seek_req.delta)
+    try:
+        s = _seek(await req.json())
+        return await service.seek(s.chat_id, s.delta)
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
 @app.post("/enqueue")
 async def enqueue(req: Request, x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret")):
     _guard(x_keepalive_secret)
-    body = await req.json()
     try:
-        return await service.enqueue(_make_queue_add(body))
+        return await service.enqueue(_queue(await req.json()))
     except Exception as e:
-        logger.exception("audio enqueue failed", extra={"body": body})
-        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
 @app.post("/queue")
 async def queue(req: Request, x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret")):
     _guard(x_keepalive_secret)
-    body = await req.json()
-    chat_id = _coerce_int(_pick(body, "chatId", "chat_id", default=0))
-    return await service.queue_list(chat_id)
+    try:
+        body = await req.json()
+        return await service.queue_list(_coerce_int(_pick(body, "chatId", "chat_id", default=0)))
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
 @app.post("/clear")
 async def clear(req: Request, x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret")):
     _guard(x_keepalive_secret)
-    body = await req.json()
-    chat_id = _coerce_int(_pick(body, "chatId", "chat_id", default=0))
-    return await service.queue_clear(chat_id)
+    try:
+        body = await req.json()
+        return await service.queue_clear(_coerce_int(_pick(body, "chatId", "chat_id", default=0)))
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
 @app.post("/skip")
 async def skip(req: Request, x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret")):
     _guard(x_keepalive_secret)
-    body = await req.json()
-    chat_id = _coerce_int(_pick(body, "chatId", "chat_id", default=0))
-    return await service.skip(chat_id)
+    try:
+        body = await req.json()
+        return await service.skip(_coerce_int(_pick(body, "chatId", "chat_id", default=0)))
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
 @app.get("/state/{chat_id}")
