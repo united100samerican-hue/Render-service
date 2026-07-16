@@ -6,12 +6,13 @@ from typing import Any
 
 from fastapi import FastAPI, Header, Request
 
-from service import TikTokService, StartRequest, service
+from service import StartRequest, service
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("tiktok_app")
 
-app = FastAPI(title="TikTok Live Service", version="1.0")
+app = FastAPI(title="TikTok Live Service", version="1.1")
+
 KEEPALIVE_SECRET = os.getenv("KEEPALIVE_SECRET", "").strip()
 
 
@@ -44,8 +45,17 @@ def _make_start(body: dict[str, Any]) -> StartRequest:
 
 @app.on_event("startup")
 async def _startup() -> None:
-    await service.boot()
-    logger.info("startup_done", extra={"ready": service.ready, "backend_error": service.backend_error})
+    try:
+        await service.boot()
+        logger.info(
+            "startup_done",
+            extra={
+                "ready": getattr(service, "ready", False),
+                "backend_error": getattr(service, "backend_error", ""),
+            },
+        )
+    except Exception:
+        logger.exception("startup_failed")
 
 
 @app.get("/")
@@ -62,14 +72,17 @@ async def ping():
 async def health():
     return {
         "ok": True,
-        "ready": service.ready,
-        "backend_error": service.backend_error,
+        "ready": getattr(service, "ready", False),
+        "backend_error": getattr(service, "backend_error", ""),
         "sessions": service.sessions_count(),
     }
 
 
 @app.post("/tiktok/start")
-async def tiktok_start(req: Request, x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret")):
+async def tiktok_start(
+    req: Request,
+    x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret"),
+):
     _guard(x_keepalive_secret)
     body = await req.json()
     try:
@@ -80,7 +93,10 @@ async def tiktok_start(req: Request, x_keepalive_secret: str | None = Header(def
 
 
 @app.post("/tiktok/stop")
-async def tiktok_stop(req: Request, x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret")):
+async def tiktok_stop(
+    req: Request,
+    x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret"),
+):
     _guard(x_keepalive_secret)
     body = await req.json()
     chat_id = _coerce_int(_pick(body, "chatId", "chat_id", default=0))
@@ -92,7 +108,10 @@ async def tiktok_stop(req: Request, x_keepalive_secret: str | None = Header(defa
 
 
 @app.post("/tiktok/state")
-async def tiktok_state(req: Request, x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret")):
+async def tiktok_state(
+    req: Request,
+    x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret"),
+):
     _guard(x_keepalive_secret)
     body = await req.json()
     chat_id = _coerce_int(_pick(body, "chatId", "chat_id", default=0))
