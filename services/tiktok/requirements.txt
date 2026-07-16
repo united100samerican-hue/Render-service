@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+telethon
+py-tgcalls
+TikTokLive
+yt-dlp[default]
+bgutil-ytdlp-pot-provider
+httpx
