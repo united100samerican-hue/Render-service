@@ -4,187 +4,192 @@ import asyncio
 import inspect
 import logging
 import os
+import re
 import tempfile
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
 import httpx
 import yt_dlp
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 
-from TikTokLive import TikTokLiveClient
-from TikTokLive.events import ConnectEvent, DisconnectEvent, RoomUserSeqEvent
-
 try:
     from pytgcalls import PyTgCalls
-except Exception:  # pragma: no cover
+except Exception:
     PyTgCalls = None
 
 AudioPiped = None
 AudioVideoPiped = None
-for _import_path in (
-    "pytgcalls.types.input_stream",
-    "pytgcalls.types.input_streams",
-    "pytgcalls.types",
-):
+for _mod_name in ("pytgcalls.types.input_stream", "pytgcalls.types.input_streams", "pytgcalls.types"):
     try:
-        _mod = __import__(_import_path, fromlist=["AudioPiped", "AudioVideoPiped"])
-        AudioPiped = getattr(_mod, "AudioPiped", AudioPiped)
-        AudioVideoPiped = getattr(_mod, "AudioVideoPiped", AudioVideoPiped)
+        _mod = __import__(_mod_name, fromlist=["AudioPiped", "AudioVideoPiped"])
+        AudioPiped = AudioPiped or getattr(_mod, "AudioPiped", None)
+        AudioVideoPiped = AudioVideoPiped or getattr(_mod, "AudioVideoPiped", None)
     except Exception:
         pass
+
+from bridge import TikTokBridge
 
 logger = logging.getLogger("tiktok_service")
 
 API_ID = int(os.getenv("API_ID", "0") or 0)
 API_HASH = os.getenv("API_HASH", "").strip()
 SESSION_STRING = os.getenv("SESSION_STRING", "").strip()
-
 TMP_ROOT = Path(os.getenv("TIKTOK_TMP_ROOT", "/tmp/tiktok-service")).resolve()
 TMP_ROOT.mkdir(parents=True, exist_ok=True)
 
 
 @dataclass
+class StartRequest:
+    chat_id: int
+    source_url: str
+    title: str = ""
+    video: bool = True
+    mode: str = "live"
+
+
+@dataclass
 class TikTokSession:
     chat_id: int
-    client: Optional[TikTokLiveClient] = None
-    viewers: int = 0
+    source_url: str = ""
     title: str = ""
     username: str = ""
-    source_url: str = ""
-    is_active: bool = False
+    viewers: int = 0
+    duration: int = 0
+    status: str = "idle"
+    mode: str = "live"
     started_at: float = 0.0
     last_seen_at: float = 0.0
-    task: Optional[asyncio.Task] = None
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    temp_files: set[str] = field(default_factory=set)
+    is_active: bool = False
+    last_error: str = ""
+    gc: Any = None
+    task: Optional[asyncio.Task] = field(default=None, repr=False, compare=False)
+    temp_files: set[str] = field(default_factory=set, repr=False, compare=False)
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False, compare=False)
 
-    def duration_seconds(self) -> int:
-        if not self.started_at:
-            return 0
-        end = self.last_seen_at if (not self.is_active and self.last_seen_at >= self.started_at) else time.time()
-        return max(0, int(end - self.started_at))
-
-    def as_state(self) -> Dict[str, Any]:
+    def as_state(self) -> dict[str, Any]:
+        elapsed = int(time.time() - self.started_at) if self.started_at else 0
         return {
             "status": "playing" if self.is_active else "idle",
+            "mode": self.mode,
             "viewers": int(self.viewers or 0),
             "title": self.title or "",
             "username": self.username or "",
             "source_url": self.source_url or "",
-            "duration": self.duration_seconds(),
-            "elapsed": self.duration_seconds(),
+            "duration": int(self.duration or 0),
+            "elapsed": elapsed,
             "started_at": int(self.started_at) if self.started_at else 0,
             "last_seen_at": int(self.last_seen_at) if self.last_seen_at else 0,
+            "last_error": self.last_error or "",
         }
 
 
-@dataclass
-class StartRequest:
-    chat_id: int
-    tiktok_url: str
-    video: bool = True
-
-
 class TikTokService:
-    def __init__(self):
-        self.api_id = API_ID
-        self.api_hash = API_HASH
-        self.session_string = SESSION_STRING
-        if not self.api_id or not self.api_hash or not self.session_string:
-            raise RuntimeError("missing_tiktok_env")
-
+    def __init__(self) -> None:
+        self.ready = False
+        self.backend_error = ""
         self.client: Optional[TelegramClient] = None
-        self.pytgcalls: Optional[PyTgCalls] = None
-        self.sessions: Dict[int, TikTokSession] = {}
+        self.pytgcalls: Optional[Any] = None
+        self.sessions: dict[int, TikTokSession] = {}
+        self.bridge = TikTokBridge()
         self._boot_lock = asyncio.Lock()
-        self._ready = False
-
-    @property
-    def ready(self) -> bool:
-        return self._ready
+        self._booted = False
 
     def sessions_count(self) -> int:
         return sum(1 for s in self.sessions.values() if s.is_active)
 
-    def _cookie_file_path(self) -> Optional[str]:
-        cookiefile = os.getenv("TIKTOK_COOKIES_FILE", "").strip()
-        if cookiefile:
-            if Path(cookiefile).exists():
-                return cookiefile
-            logger.warning("TIKTOK_COOKIES_FILE is set but file does not exist: %s", cookiefile)
+    async def _maybe(self, v: Any) -> Any:
+        return await v if inspect.isawaitable(v) else v
 
-        raw_cookies = os.getenv("TIKTOK_COOKIES_TEXT", "").strip() or os.getenv("TIKTOK_COOKIES", "").strip()
-        if raw_cookies:
-            tmp_path = Path(tempfile.gettempdir()) / "tiktok_cookies.txt"
-            try:
-                tmp_path.write_text(raw_cookies, encoding="utf-8")
-                return str(tmp_path)
-            except Exception:
-                logger.exception("Failed to write TikTok cookies to temp file")
-        return None
+    def _ensure(self, chat_id: int) -> TikTokSession:
+        s = self.sessions.get(chat_id)
+        if not s:
+            s = TikTokSession(chat_id=chat_id)
+            self.sessions[chat_id] = s
+        return s
 
-    async def _maybe_await(self, value: Any) -> Any:
-        return await value if inspect.isawaitable(value) else value
-
-    def _remember_temp(self, session: TikTokSession, path: str) -> str:
-        session.temp_files.add(path)
+    def _tmp(self, suffix: str) -> str:
+        fd, path = tempfile.mkstemp(prefix="tiktok_", suffix=suffix, dir=str(TMP_ROOT))
+        os.close(fd)
         return path
 
-    def _extract_unique_id(self, url: str) -> Optional[str]:
-        if not url:
-            return None
-        txt = str(url).strip()
-        for pattern in (r"@([\w\.-]+)", r"tiktok\.com/@([\w\.-]+)"):
-            m = __import__("re").search(pattern, txt, __import__("re").I)
-            if m:
-                return m.group(1)
+    def _remember(self, s: TikTokSession, path: str) -> str:
+        s.temp_files.add(path)
+        return path
+
+    def _cookie_file_path(self) -> Optional[str]:
+        cookiefile = os.getenv("TIKTOK_COOKIES_FILE", "").strip()
+        if cookiefile and Path(cookiefile).exists():
+            return cookiefile
+        raw = (os.getenv("TIKTOK_COOKIES_TEXT", "").strip() or os.getenv("TIKTOK_COOKIES", "").strip())
+        if raw:
+            p = Path(tempfile.gettempdir()) / "tiktok_cookies.txt"
+            try:
+                p.write_text(raw, encoding="utf-8")
+                return str(p)
+            except Exception:
+                logger.exception("Failed to write cookie file")
         return None
+
+    def _extract_unique_id(self, url: str) -> Optional[str]:
+        txt = str(url or "").strip()
+        m = re.search(r"(?:tiktok\.com/@|@)([\w\.-]+)", txt, re.I)
+        return m.group(1) if m else None
 
     def _pick_stream_url(self, info: dict) -> Optional[str]:
         for key in ("url", "play_url", "stream_url"):
-            val = info.get(key)
-            if val:
-                return str(val)
+            if info.get(key):
+                return str(info[key])
         fmts = info.get("formats") or []
-        best = None
-        best_score = -1
+        best, score = None, -1
         for f in fmts:
-            score = 0
+            if not f.get("url"):
+                continue
+            s = 0
             if f.get("acodec") and f.get("acodec") != "none":
-                score += 1
+                s += 1
             if f.get("vcodec") and f.get("vcodec") != "none":
-                score += 1
-            if score > best_score and f.get("url"):
-                best_score = score
-                best = f
+                s += 1
+            if s > score:
+                best, score = f, s
         return best.get("url") if best else None
 
     async def _get_stream_url(self, url: str) -> Optional[str]:
+        cookiefile = self._cookie_file_path()
+        ydl_opts = {"quiet": True, "no_warnings": True, "noplaylist": True, "format": "best"}
+        if cookiefile:
+            ydl_opts["cookiefile"] = cookiefile
+
+        def _extract():
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                if not info:
+                    return None
+                return str(info.get("url") or self._pick_stream_url(info) or "")
+
         try:
-            ydl_opts = {"format": "best", "quiet": True, "no_warnings": True, "noplaylist": True}
-            cookiefile = self._cookie_file_path()
-            if cookiefile:
-                ydl_opts["cookiefile"] = cookiefile
-
-            def _extract() -> Optional[str]:
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(url, download=False)
-                    if not info:
-                        return None
-                    if info.get("is_live") and info.get("url"):
-                        return str(info["url"])
-                    return self._pick_stream_url(info)
-
             return await asyncio.to_thread(_extract)
-        except Exception as exc:
-            logger.warning("TikTok stream extraction failed: %s", exc)
+        except Exception as e:
+            logger.warning("TikTok stream extraction failed: %s", e)
             return None
 
-    async def _join_with_fallbacks(self, chat_id: int, stream_url: str, video: bool) -> None:
+    async def _download_http(self, url: str, s: TikTokSession) -> str:
+        ext = Path(url.split("?", 1)[0]).suffix or ".bin"
+        out = self._tmp(ext)
+        timeout = httpx.Timeout(30.0, connect=30.0, read=None, write=30.0, pool=30.0)
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            async with client.stream("GET", url) as r:
+                r.raise_for_status()
+                with open(out, "wb") as f:
+                    async for chunk in r.aiter_bytes(256 * 1024):
+                        if chunk:
+                            f.write(chunk)
+        return self._remember(s, out)
+
+    async def _join_telegram_vc(self, chat_id: int, stream_url: str, video: bool) -> None:
         if not self.pytgcalls:
             raise RuntimeError("pytgcalls_not_ready")
 
@@ -193,135 +198,143 @@ class TikTokService:
             try:
                 await self.pytgcalls.join_group_call(chat_id, AudioVideoPiped(stream_url))
                 joined = True
-            except Exception as exc:
-                logger.warning("AudioVideoPiped join failed: %s", exc)
+            except Exception as e:
+                logger.warning("AudioVideoPiped join failed: %s", e)
 
         if not joined and AudioPiped is not None and hasattr(self.pytgcalls, "join_group_call"):
             try:
                 await self.pytgcalls.join_group_call(chat_id, AudioPiped(stream_url))
                 joined = True
-            except Exception as exc:
-                logger.warning("AudioPiped join failed: %s", exc)
+            except Exception as e:
+                logger.warning("AudioPiped join failed: %s", e)
 
         if not joined and hasattr(self.pytgcalls, "play"):
             try:
                 await self.pytgcalls.play(chat_id, stream_url)
                 joined = True
-            except Exception as exc:
-                logger.warning("play() fallback failed: %s", exc)
+            except Exception as e:
+                logger.warning("play() fallback failed: %s", e)
 
         if not joined:
             raise RuntimeError("tiktok_join_failed")
 
-    def _attach_events(self, session: TikTokSession) -> None:
-        if not session.client:
-            return
-
-        @session.client.on(ConnectEvent)
-        async def on_connect(_: ConnectEvent):
-            session.is_active = True
-            now = time.time()
-            session.last_seen_at = now
-            if not session.started_at:
-                session.started_at = now
-
-        @session.client.on(RoomUserSeqEvent)
-        async def on_viewers(event: RoomUserSeqEvent):
-            session.viewers = int(getattr(event, "user_count", getattr(event, "viewer_count", 0)) or 0)
-            session.last_seen_at = time.time()
-
-        @session.client.on(DisconnectEvent)
-        async def on_disconnect(_: DisconnectEvent):
-            session.is_active = False
-            session.last_seen_at = time.time()
-
-        async def _run_client():
-            try:
-                await session.client.start()
-            except Exception as exc:
-                logger.warning("TikTok client task stopped: %s", exc)
-
-        session.task = asyncio.create_task(_run_client())
-
     async def boot(self) -> None:
-        if self._ready:
+        if self._booted:
             return
         async with self._boot_lock:
-            if self._ready:
+            if self._booted:
                 return
-            self.client = TelegramClient(StringSession(self.session_string), self.api_id, self.api_hash)
-            if not self.client.is_connected():
-                await self._maybe_await(self.client.start())
-            self.pytgcalls = PyTgCalls(self.client)
-            await self._maybe_await(self.pytgcalls.start())
-            self._ready = True
-            logger.info("TikTokService booted successfully")
+            if not SESSION_STRING or not API_ID or not API_HASH:
+                self.backend_error = "missing_env"
+                self.ready = False
+                return
+            if PyTgCalls is None:
+                self.backend_error = "pytgcalls_missing"
+                self.ready = False
+                return
+            try:
+                self.client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+                await self._maybe(self.client.start())
+                self.pytgcalls = PyTgCalls(self.client)
+                await self._maybe(self.pytgcalls.start())
+                self.ready = True
+                self.backend_error = ""
+                self._booted = True
+                logger.info("TikTokService booted successfully")
+            except Exception as e:
+                self.ready = False
+                self.backend_error = f"{type(e).__name__}: {e}"
+                logger.exception("TikTok boot failed")
+                try:
+                    if self.client:
+                        await self._maybe(self.client.disconnect())
+                except Exception:
+                    pass
+                self.client = None
+                self.pytgcalls = None
 
-    def _ensure_session(self, chat_id: int) -> TikTokSession:
-        session = self.sessions.get(chat_id)
-        if not session:
-            session = TikTokSession(chat_id=chat_id)
-            self.sessions[chat_id] = session
-        return session
+    async def meta(self, payload: StartRequest) -> dict[str, Any]:
+        s = self._ensure(payload.chat_id)
+        s.source_url = str(payload.source_url or "").strip()
+        s.title = str(payload.title or "").strip() or s.title
+        s.mode = "bridge_audio" if str(payload.mode or "").strip() == "bridge_audio" else "live"
+        s.last_seen_at = time.time()
+        return s.as_state()
 
-    async def start(self, payload: StartRequest) -> Dict[str, Any]:
+    async def start(self, payload: StartRequest) -> dict[str, Any]:
         await self.boot()
-        session = self._ensure_session(payload.chat_id)
+        if not self.ready:
+            return {"ok": False, "error": f"service_not_ready: {self.backend_error or 'missing_env'}"}
 
+        session = self._ensure(payload.chat_id)
         async with session.lock:
             try:
-                tiktok_url = (payload.tiktok_url or "").strip()
-                if not tiktok_url:
+                source = str(payload.source_url or "").strip()
+                if not source:
                     return {"ok": False, "error": "رابط تيك توك غير موجود"}
 
-                stream_url = await self._get_stream_url(tiktok_url)
+                session.mode = "bridge_audio" if str(payload.mode or "").strip() == "bridge_audio" else "live"
+                session.source_url = source
+                session.title = str(payload.title or "").strip() or "TikTok Live"
+                session.username = self._extract_unique_id(source) or ""
+                session.viewers = 0
+                session.duration = 0
+                session.is_active = False
+                session.started_at = 0.0
+                session.last_seen_at = time.time()
+                session.last_error = ""
+
+                stream_url = await self._get_stream_url(source)
                 if not stream_url:
                     return {"ok": False, "error": "تعذر استخراج رابط البث"}
 
-                unique_id = self._extract_unique_id(tiktok_url)
-                session.client = TikTokLiveClient(unique_id=unique_id) if unique_id else None
-                session.source_url = tiktok_url
-                session.title = "TikTok Live"
-                session.username = unique_id or "unknown"
-                session.viewers = 0
-                session.is_active = False
-                session.started_at = 0.0
-                session.last_seen_at = 0.0
+                if session.mode == "bridge_audio":
+                    result = await self.bridge.start(chat_id=payload.chat_id, source_url=source, title=session.title)
+                    if not result.ok:
+                        return {"ok": False, "error": result.error}
+                    session.is_active = True
+                    session.status = "playing"
+                    session.started_at = time.time()
+                    session.last_seen_at = time.time()
+                    return {"ok": True, "state": session.as_state(), "bridge": True}
 
-                if session.client:
-                    self._attach_events(session)
-
-                await self._join_with_fallbacks(payload.chat_id, stream_url, payload.video)
-
+                await self._join_telegram_vc(payload.chat_id, stream_url, payload.video)
                 now = time.time()
                 session.is_active = True
+                session.status = "playing"
                 session.started_at = now
                 session.last_seen_at = now
-
                 return {"ok": True, "state": session.as_state()}
             except Exception as e:
-                logger.error("TikTok start error: %s", e)
-                return {"ok": False, "error": str(e)}
+                session.status = "error"
+                session.last_error = f"{type(e).__name__}: {e}"
+                logger.exception("TikTok start error")
+                return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
-    async def stop(self, chat_id: int) -> Dict[str, Any]:
+    async def stop(self, chat_id: int) -> dict[str, Any]:
         session = self.sessions.get(chat_id)
-        if not session or not session.is_active:
-            return {"ok": False, "error": "لا يوجد بث نشط"}
+        if not session:
+            return {"ok": False, "error": "لا توجد جلسة"}
 
         async with session.lock:
             try:
+                if session.mode == "bridge_audio":
+                    try:
+                        await self.bridge.stop(chat_id=chat_id)
+                    except Exception:
+                        pass
+
                 if self.pytgcalls:
-                    try:
-                        if hasattr(self.pytgcalls, "leave_group_call"):
-                            await self.pytgcalls.leave_group_call(chat_id)
-                    except Exception:
-                        pass
+                    for name in ("leave_current_group_call", "leave_group_call", "leave", "stop"):
+                        fn = getattr(self.pytgcalls, name, None)
+                        if callable(fn):
+                            try:
+                                await self._maybe(fn(chat_id) if name == "stop" else fn())
+                            except Exception:
+                                pass
 
-                    try:
-                        if hasattr(self.pytgcalls, "stop"):
-                            await self.pytgcalls.stop(chat_id)
-                    except Exception:
-                        pass
+                if session.task and not session.task.done():
+                    session.task.cancel()
 
                 if session.client:
                     try:
@@ -329,61 +342,18 @@ class TikTokService:
                     except Exception:
                         pass
 
-                if session.task and not session.task.done():
-                    session.task.cancel()
-
-                session.last_seen_at = time.time()
                 session.is_active = False
                 session.viewers = 0
-
+                session.status = "stopped"
+                session.last_seen_at = time.time()
                 return {"ok": True, "state": session.as_state()}
             except Exception as e:
-                logger.error("TikTok stop error: %s", e)
-                return {"ok": False, "error": str(e)}
+                session.last_error = f"{type(e).__name__}: {e}"
+                logger.exception("TikTok stop error")
+                return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
-    async def state(self, chat_id: int) -> Dict[str, Any]:
+    async def state(self, chat_id: int) -> dict[str, Any]:
         session = self.sessions.get(chat_id)
-        if not session:
-            return {"status": "idle", "viewers": 0, "title": "", "username": "", "source_url": "", "duration": 0, "elapsed": 0}
-        return session.as_state()
-
-    async def cleanup(self, chat_id: int) -> None:
-        session = self.sessions.get(chat_id)
-        if not session:
-            return
-        async with session.lock:
-            try:
-                if session.task and not session.task.done():
-                    session.task.cancel()
-            finally:
-                session.is_active = False
-                session.viewers = 0
-                if session.client:
-                    try:
-                        await session.client.disconnect()
-                    except Exception:
-                        pass
-                for p in list(session.temp_files):
-                    try:
-                        Path(p).unlink(missing_ok=True)
-                    except Exception:
-                        pass
-                session.temp_files.clear()
-
-    async def shutdown(self) -> None:
-        for chat_id in list(self.sessions.keys()):
-            await self.cleanup(chat_id)
-        if self.pytgcalls:
-            try:
-                if hasattr(self.pytgcalls, "stop"):
-                    await self.pytgcalls.stop()
-            except Exception:
-                pass
-        if self.client:
-            try:
-                await self.client.disconnect()
-            except Exception:
-                pass
-
+        return session.as_state() if session else {"status": "idle", "mode": "live", "viewers": 0, "title": "", "username": "", "source_url": "", "duration": 0, "elapsed": 0}
 
 service = TikTokService()
