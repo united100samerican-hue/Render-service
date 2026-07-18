@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import logging
@@ -8,7 +9,11 @@ from fastapi import FastAPI, Header, Request
 
 from service import service
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+
 logger = logging.getLogger("tiktok.app")
 
 app = FastAPI(title="TikTok Bridge Service", version="1.0.0")
@@ -28,6 +33,16 @@ async def _json(req: Request) -> dict[str, Any]:
         return {}
 
 
+@app.get("/")
+async def root():
+    return {"ok": True, "service": "tiktok"}
+
+
+@app.get("/health")
+async def health():
+    return {"ok": True, "ready": service.ready, "error": service.backend_error}
+
+
 @app.get("/healthz")
 async def healthz():
     return {"ok": True, "ready": service.ready, "error": service.backend_error}
@@ -35,7 +50,10 @@ async def healthz():
 
 @app.post("/start")
 @app.post("/tiktok/start")
-async def start(req: Request, x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret")):
+async def start(
+    req: Request,
+    x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret"),
+):
     _guard(x_keepalive_secret)
     try:
         body = await _json(req)
@@ -47,7 +65,10 @@ async def start(req: Request, x_keepalive_secret: str | None = Header(default=No
 
 @app.post("/stop")
 @app.post("/tiktok/stop")
-async def stop(req: Request, x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret")):
+async def stop(
+    req: Request,
+    x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret"),
+):
     _guard(x_keepalive_secret)
     try:
         body = await _json(req)
@@ -59,7 +80,10 @@ async def stop(req: Request, x_keepalive_secret: str | None = Header(default=Non
 
 @app.post("/state")
 @app.post("/tiktok/state")
-async def state(req: Request, x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret")):
+async def state(
+    req: Request,
+    x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret"),
+):
     _guard(x_keepalive_secret)
     try:
         body = await _json(req)
@@ -71,7 +95,10 @@ async def state(req: Request, x_keepalive_secret: str | None = Header(default=No
 
 @app.post("/meta")
 @app.post("/tiktok/meta")
-async def meta(req: Request, x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret")):
+async def meta(
+    req: Request,
+    x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret"),
+):
     _guard(x_keepalive_secret)
     try:
         body = await _json(req)
