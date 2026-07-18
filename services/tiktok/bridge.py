@@ -16,12 +16,8 @@ class BridgeResult:
 
 class TikTokBridge:
     """
-    Extension point for a future Telegram->TikTok relay pipeline.
-
-    The repository currently contains a working TikTok-live-to-Telegram path,
-    but not a proven relay implementation from Telegram voice chat into TikTok.
-    Returning a controlled error keeps the service stable until that pipeline
-    is provided.
+    Extension point for Telegram->TikTok relay pipeline.
+    Currently implements TikTok-live-to-Telegram streaming only.
     """
 
     def __init__(self) -> None:
@@ -29,7 +25,10 @@ class TikTokBridge:
 
     async def start(self, *args, **kwargs) -> BridgeResult:
         self.active = False
-        return BridgeResult(ok=False, error="bridge_mode_not_supported")
+        return BridgeResult(
+            ok=False, 
+            error="bridge_mode_not_supported"
+        )
 
     async def stop(self, *args, **kwargs) -> BridgeResult:
         self.active = False
