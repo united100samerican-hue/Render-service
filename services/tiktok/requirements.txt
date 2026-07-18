@@ -5,3 +5,4 @@ py-tgcalls==2.3.3
 TikTokLive==6.6.5
 yt-dlp==2026.7.4
 httpx==0.28.1
+pydantic
