@@ -330,20 +330,20 @@ class TikTokService:
                         pass
 
                 if self.pytgcalls:
-                    for name in ("leave_current_group_call", "leave_group_call", "leave", "stop"):
-                        fn = getattr(self.pytgcalls, name, None)
-                        if not callable(fn):
-                            continue
-                        try:
-                            if name == "stop":
-                                await self._maybe(fn(chat_id))
-                            else:
-                                try:
-                                    await self._maybe(fn())
-                                except TypeError:
-                                    await self._maybe(fn(chat_id))
-                        except Exception:
-                            pass
+    try:
+        stop_fn=getattr(self.pytgcalls,"stop",None)
+        if callable(stop_fn):
+            await self._maybe(stop_fn())
+        else:
+            leave_fn=getattr(self.pytgcalls,"leave_current_group_call",None)
+            if callable(leave_fn):
+                await self._maybe(leave_fn())
+    except Exception as e:
+        logger.warning("TikTok leave failed: %s", e)
+
+if session.task and not session.task.done():
+    session.task.cancel()
+    session.task=None
 
                 if session.task and not session.task.done():
                     session.task.cancel()
