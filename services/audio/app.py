@@ -154,10 +154,9 @@ async def root() -> dict[str, Any]:
     return {"ok": True, "service": "render-audio-service", "ready": service.ready}
 
 
-@app.get("/ping")
-async def ping(x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret")) -> dict[str, Any]:
-    _guard(x_keepalive_secret)
-    return {"ok": True}
+@app.get("/ping", response_class=PlainTextResponse)
+async def ping():
+    return "OK"
 
 
 @app.get("/health")
