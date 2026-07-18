@@ -5,6 +5,7 @@ import os
 from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import PlainTextResponse
 
 from service import StartRequest, service
 
@@ -62,9 +63,9 @@ async def root():
     return {"ok": True, "service": "tiktok"}
 
 
-@app.get("/ping")
+@app.get("/ping", response_class=PlainTextResponse)
 async def ping():
-    return {"ok": True, "service": "tiktok", "ping": True}
+    return "OK"
 
 
 @app.get("/health")
