@@ -348,11 +348,6 @@ class TikTokService:
                 if session.task and not session.task.done():
                     session.task.cancel()
 
-                if session.client:
-                    try:
-                        await session.client.disconnect()
-                    except Exception:
-                        pass
 
                 session.is_active = False
                 session.viewers = 0
