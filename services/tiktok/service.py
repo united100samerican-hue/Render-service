@@ -316,45 +316,52 @@ class TikTokService:
                 logger.exception("TikTok start error")
                 return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
-    async def stop(self, chat_id: int) -> dict[str, Any]:
+        async def stop(self, chat_id: int) -> dict[str, Any]:
         session = self.sessions.get(chat_id)
         if not session:
             return {"ok": False, "error": "لا توجد جلسة"}
-
         async with session.lock:
             try:
                 if session.mode == "bridge_audio":
                     try:
                         await self.bridge.stop(chat_id=chat_id)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.warning("TikTok bridge stop failed: %s", e)
 
                 if self.pytgcalls:
-    try:
-        stop_fn=getattr(self.pytgcalls,"stop",None)
-        if callable(stop_fn):
-            await self._maybe(stop_fn())
-        else:
-            leave_fn=getattr(self.pytgcalls,"leave_current_group_call",None)
-            if callable(leave_fn):
-                await self._maybe(leave_fn())
-    except Exception as e:
-        logger.warning("TikTok leave failed: %s", e)
-
-if session.task and not session.task.done():
-    session.task.cancel()
-    session.task=None
+                    stopped = False
+                    for name in ("stop", "leave_current_group_call", "leave_group_call", "leave"):
+                        fn = getattr(self.pytgcalls, name, None)
+                        if not callable(fn):
+                            continue
+                        try:
+                            if name == "stop":
+                                try:
+                                    await self._maybe(fn(chat_id))
+                                except TypeError:
+                                    await self._maybe(fn())
+                            else:
+                                try:
+                                    await self._maybe(fn())
+                                except TypeError:
+                                    await self._maybe(fn(chat_id))
+                            stopped = True
+                            break
+                        except Exception as e:
+                            logger.warning("TikTok leave failed (%s): %s", name, e)
+                    if not stopped:
+                        logger.warning("TikTok stop fallback did not find a usable backend method")
 
                 if session.task and not session.task.done():
                     session.task.cancel()
-
+                session.task = None
 
                 session.is_active = False
                 session.viewers = 0
                 session.status = "stopped"
                 session.last_seen_at = time.time()
+                session.last_error = ""
                 return {"ok": True, "state": session.as_state()}
-
             except Exception as e:
                 session.last_error = f"{type(e).__name__}: {e}"
                 logger.exception("TikTok stop error")
