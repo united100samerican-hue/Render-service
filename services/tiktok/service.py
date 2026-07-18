@@ -70,6 +70,7 @@ class TikTokSession:
     task: Optional[asyncio.Task] = field(default=None, repr=False, compare=False)
     temp_files: set[str] = field(default_factory=set, repr=False, compare=False)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False, compare=False)
+last_cleanup: float = field(default_factory=time.time, repr=False, compare=False)
 
     def as_state(self) -> dict[str, Any]:
         elapsed = int(time.time() - self.started_at) if self.started_at else 0
