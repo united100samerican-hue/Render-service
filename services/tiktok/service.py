@@ -40,6 +40,7 @@ API_HASH = os.getenv("API_HASH", "").strip()
 SESSION_STRING = os.getenv("SESSION_STRING", "").strip()
 TMP_ROOT = Path(os.getenv("TIKTOK_TMP_ROOT", "/tmp/tiktok-service")).resolve()
 TMP_ROOT.mkdir(parents=True, exist_ok=True)
+CLEANUP_INTERVAL = 300  # 5 minutes
 
 
 @dataclass
