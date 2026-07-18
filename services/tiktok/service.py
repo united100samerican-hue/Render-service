@@ -123,6 +123,18 @@ class TikTokService:
         s.temp_files.add(path)
         return path
 
+    def _cleanup_temp_files(self, s: TikTokSession) -> None:
+    """Clean up temporary files for session."""
+    for path in s.temp_files:
+        try:
+            p = Path(path)
+            if p.exists():
+                p.unlink(missing_ok=True)
+                logger.info(f"Cleaned up temp file: {path}")
+        except Exception as e:
+            logger.warning(f"Failed to clean temp file {path}: {e}")
+    s.temp_files.clear()
+
     def _cookie_file_path(self) -> Optional[str]:
         cookiefile = os.getenv("TIKTOK_COOKIES_FILE", "").strip()
         if cookiefile and Path(cookiefile).exists():
