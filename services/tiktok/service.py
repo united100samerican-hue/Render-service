@@ -99,6 +99,7 @@ class TikTokService:
         self.bridge = TikTokBridge()
         self._boot_lock = asyncio.Lock()
         self._booted = False
+        self._cleanup_task: Optional[asyncio.Task] = None
 
     def sessions_count(self) -> int:
         return sum(1 for s in self.sessions.values() if s.is_active)
