@@ -4,83 +4,33 @@ import logging
 import os
 from typing import Any
 
-from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.responses import PlainTextResponse
+from fastapi import FastAPI, Header, Request
 
-from service import StartRequest, service
+from service import service
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-logger = logging.getLogger("tiktok_app")
+logger = logging.getLogger("tiktok.app")
 
-app = FastAPI(title="TikTok Live Service", version="3.0")
-KEEPALIVE_SECRET = os.getenv("KEEPALIVE_SECRET", "").strip()
-
-
-def _guard(secret: str | None) -> None:
-    if KEEPALIVE_SECRET and (secret or "").strip() != KEEPALIVE_SECRET:
-        raise HTTPException(status_code=403, detail="forbidden")
+app = FastAPI(title="TikTok Bridge Service", version="1.0.0")
 
 
-def _pick(body: dict[str, Any], *names: str, default: Any = None) -> Any:
-    for n in names:
-        if n in body and body[n] is not None:
-            return body[n]
-    return default
+def _guard(x_keepalive_secret: str | None) -> None:
+    expected = (os.getenv("KEEPALIVE_SECRET") or "").strip()
+    if expected and (x_keepalive_secret or "").strip() != expected:
+        raise PermissionError("unauthorized")
 
 
-def _coerce_int(v: Any, default: int = 0) -> int:
+async def _json(req: Request) -> dict[str, Any]:
     try:
-        return int(v)
+        body = await req.json()
+        return body if isinstance(body, dict) else {}
     except Exception:
-        return default
-
-
-def _start_from_body(body: dict[str, Any]) -> StartRequest:
-    return StartRequest(
-        chat_id=_coerce_int(_pick(body, "chatId", "chat_id", default=0)),
-        source_url=str(_pick(body, "source_url", "sourceUrl", "tiktok_url", "url", default="")),
-        title=str(_pick(body, "title", default="")),
-        video=bool(_pick(body, "video", default=True)),
-        mode=str(_pick(body, "mode", default="live")),
-    )
-
-
-def _chat_id_from_body(body: dict[str, Any]) -> int:
-    return _coerce_int(_pick(body, "chatId", "chat_id", default=0))
-
-
-@app.on_event("startup")
-async def _startup() -> None:
-    try:
-        await service.boot()
-        logger.info("startup_done", extra={"ready": service.ready, "backend_error": service.backend_error})
-    except Exception:
-        logger.exception("startup_failed")
-
-
-@app.get("/")
-async def root():
-    return {"ok": True, "service": "tiktok"}
-
-
-@app.get("/ping", response_class=PlainTextResponse)
-async def ping():
-    return "OK"
-
-
-@app.get("/health")
-async def health():
-    return {
-        "ok": True,
-        "ready": service.ready,
-        "backend_error": service.backend_error,
-        "sessions": service.sessions_count(),
-    }
+        return {}
 
 
 @app.get("/healthz")
 async def healthz():
-    return {"ok": True, "ready": service.ready}
+    return {"ok": True, "ready": service.ready, "error": service.backend_error}
 
 
 @app.post("/start")
@@ -88,10 +38,10 @@ async def healthz():
 async def start(req: Request, x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret")):
     _guard(x_keepalive_secret)
     try:
-        body = await req.json()
-        return await service.start(_start_from_body(body))
+        body = await _json(req)
+        return await service.start(body)
     except Exception as e:
-        logger.exception("tiktok_start_failed")
+        logger.exception("start_failed")
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
@@ -100,10 +50,10 @@ async def start(req: Request, x_keepalive_secret: str | None = Header(default=No
 async def stop(req: Request, x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret")):
     _guard(x_keepalive_secret)
     try:
-        body = await req.json()
-        return await service.stop(_chat_id_from_body(body))
+        body = await _json(req)
+        return await service.stop(body)
     except Exception as e:
-        logger.exception("tiktok_stop_failed")
+        logger.exception("stop_failed")
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
@@ -111,21 +61,21 @@ async def stop(req: Request, x_keepalive_secret: str | None = Header(default=Non
 @app.post("/tiktok/state")
 async def state(req: Request, x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret")):
     _guard(x_keepalive_secret)
-    body = await req.json()
-    chat_id = _chat_id_from_body(body)
     try:
-        return {"ok": True, "state": await service.state(chat_id)}
+        body = await _json(req)
+        return await service.state(body)
     except Exception as e:
-        logger.exception("tiktok_state_failed")
+        logger.exception("state_failed")
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
 @app.post("/meta")
+@app.post("/tiktok/meta")
 async def meta(req: Request, x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret")):
     _guard(x_keepalive_secret)
-    body = await req.json()
     try:
-        return {"ok": True, "state": await service.meta(_start_from_body(body))}
+        body = await _json(req)
+        return await service.meta(body)
     except Exception as e:
-        logger.exception("tiktok_meta_failed")
+        logger.exception("meta_failed")
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
