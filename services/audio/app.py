@@ -5,7 +5,7 @@ import os
 from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import PlainTextResponse
 
 from service import service
 
