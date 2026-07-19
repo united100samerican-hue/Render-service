@@ -3,66 +3,68 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import subprocess
 import time
+from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
-import pytgcalls
+try:
+    from pytgcalls import GroupCallFactory
+except Exception:
+    try:
+        from py_tgcalls import GroupCallFactory  # type: ignore
+    except Exception:
+        GroupCallFactory = None  # type: ignore
 
 log = logging.getLogger("tiktok.bridge")
 
 
+def _s(v: Any) -> str:
+    return str(v or "").strip()
+
+
 @dataclass
-class BridgeState:
+class TikTokSessionState:
     chat_id: int
-    title: str = ""
+    title: str = "TikTok Live"
+    source_url: str = ""
     rtmp_url: str = ""
-    mode: str = "bridge_audio"
+    mode: str = "live"
     status: str = "idle"
-    started_at: float = 0.0
-    last_seen_at: float = 0.0
-    frames_in: int = 0
-    bytes_in: int = 0
-    ffmpeg_pid: int = 0
     last_error: str = ""
     active: bool = False
-    metadata: dict[str, Any] = field(default_factory=dict)
+    bridge_enabled: bool = False
+    started_at: float = 0.0
+    last_seen_at: float = 0.0
+    ffmpeg_pid: int = 0
+    audio_frames: int = 0
+    join_as: Any = None
+    invite_hash: str | None = None
 
     def public(self) -> dict[str, Any]:
         return {
             "chat_id": self.chat_id,
             "title": self.title,
+            "source_url": self.source_url,
             "rtmp_url": self.rtmp_url,
             "mode": self.mode,
             "status": self.status,
-            "started_at": self.started_at,
-            "last_seen_at": self.last_seen_at,
-            "frames_in": self.frames_in,
-            "bytes_in": self.bytes_in,
-            "ffmpeg_pid": self.ffmpeg_pid,
             "last_error": self.last_error,
             "active": self.active,
-            "metadata": self.metadata,
+            "bridge_enabled": self.bridge_enabled,
+            "started_at": int(self.started_at),
+            "last_seen_at": int(self.last_seen_at),
+            "ffmpeg_pid": self.ffmpeg_pid,
+            "viewers": 0,
+            "duration": max(0, int(time.time() - self.started_at)) if self.started_at else 0,
         }
 
 
 class TelegramToTikTokBridge:
-    """
-    Telegram voice chat -> TikTok RTMP bridge.
-
-    Design:
-    - Join Telegram group call using pytgcalls GroupCallRaw.
-    - Receive PCM 16-bit audio in on_recorded_data.
-    - Feed raw PCM to ffmpeg through stdin.
-    - ffmpeg outputs black video + captured audio to TikTok RTMP.
-
-    Required env or payload:
-    - TIKTOK_RTMP_URL (preferred)
-    """
-
     def __init__(
         self,
-        client,
+        client: Any,
         *,
         ffmpeg_bin: str = "ffmpeg",
         video_size: str = "1280x720",
@@ -71,73 +73,95 @@ class TelegramToTikTokBridge:
         output_sample_rate: int = 48000,
         output_channels: int = 2,
     ) -> None:
+        if GroupCallFactory is None:
+            raise RuntimeError("pytgcalls_unavailable")
+
         self.client = client
         self.ffmpeg_bin = ffmpeg_bin
         self.video_size = video_size
-        self.fps = int(fps)
-        self.audio_bitrate_kbps = int(audio_bitrate_kbps)
-        self.output_sample_rate = int(output_sample_rate)
-        self.output_channels = int(output_channels)
+        self.fps = fps
+        self.audio_bitrate_kbps = audio_bitrate_kbps
+        self.output_sample_rate = output_sample_rate
+        self.output_channels = output_channels
 
-        self._factory = pytgcalls.GroupCallFactory(
-            client,
-            pytgcalls.GroupCallFactory.MTPROTO_CLIENT_TYPE.TELETHON,
-        )
-
-        self._lock = asyncio.Lock()
+        self._factory = GroupCallFactory(client)
+        self._states: dict[int, TikTokSessionState] = {}
+        self._locks = defaultdict(asyncio.Lock)
         self._loop: asyncio.AbstractEventLoop | None = None
-        self._queue: asyncio.Queue[bytes] | None = None
-        self._writer_task: asyncio.Task | None = None
-        self._stderr_task: asyncio.Task | None = None
-        self._group_call = None
-        self._ffmpeg = None
-        self._state: dict[str, BridgeState] = {}
+        self._queues: dict[int, asyncio.Queue[bytes]] = {}
+        self._ffmpeg: dict[int, subprocess.Popen | None] = {}
+        self._group_call: dict[int, Any] = {}
+        self._writer_task: dict[int, asyncio.Task | None] = {}
+        self._stderr_task: dict[int, asyncio.Task | None] = {}
+        self._silence_task: dict[int, asyncio.Task | None] = {}
 
-    def _get_state(self, chat_id: int) -> BridgeState:
-        key = str(chat_id)
-        if key not in self._state:
-            self._state[key] = BridgeState(chat_id=chat_id)
-        return self._state[key]
+    def _get_state(self, chat_id: int) -> TikTokSessionState:
+        chat_id = int(chat_id)
+        if chat_id not in self._states:
+            self._states[chat_id] = TikTokSessionState(chat_id=chat_id)
+        return self._states[chat_id]
 
     def state(self, chat_id: int) -> dict[str, Any]:
         return self._get_state(chat_id).public()
 
-    def _enqueue_audio(self, chat_id: int, frame: bytes, length: int) -> None:
-        st = self._get_state(chat_id)
-        payload = (frame or b"")[: max(0, int(length or 0))]
-        if not payload:
+    def _make_group_call(self, chat_id: int):
+        state = self._get_state(chat_id)
+
+        def on_played_data(_call, length: int) -> bytes:
+            return b"\x00" * max(0, int(length or 0))
+
+        def on_recorded_data(_call, frame: bytes, length: int) -> None:
+            if not self._loop:
+                return
+            if not state.active or not state.bridge_enabled or state.mode != "bridge_audio":
+                return
+            try:
+                self._loop.call_soon_threadsafe(self._enqueue_audio, chat_id, frame)
+            except Exception:
+                pass
+
+        return self._factory.get_raw_group_call(
+            on_played_data=on_played_data,
+            on_recorded_data=on_recorded_data,
+            enable_logs_to_console=False,
+            outgoing_audio_bitrate_kbit=self.audio_bitrate_kbps,
+        )
+
+    def _enqueue_audio(self, chat_id: int, frame: bytes) -> None:
+        q = self._queues.get(chat_id)
+        if not q:
             return
-
-        st.frames_in += 1
-        st.bytes_in += len(payload)
-        st.last_seen_at = time.time()
-
-        if not self._queue:
-            return
-
         try:
-            self._queue.put_nowait(payload)
+            q.put_nowait(frame)
+            st = self._get_state(chat_id)
+            st.audio_frames += 1
+            st.last_seen_at = time.time()
         except asyncio.QueueFull:
-            try:
-                _ = self._queue.get_nowait()
-            except Exception:
-                pass
-            try:
-                self._queue.put_nowait(payload)
-            except Exception:
-                pass
+            pass
 
-    async def _spawn_ffmpeg(self, rtmp_url: str) -> None:
+    def _silence_frame(self) -> bytes:
+        bytes_per_second = self.output_sample_rate * self.output_channels * 2
+        return b"\x00" * max(1, bytes_per_second // 10)
+
+    async def _feed_silence(self, chat_id: int) -> None:
+        st = self._get_state(chat_id)
+        q = self._queues[chat_id]
+        silence = self._silence_frame()
+        while st.active:
+            try:
+                if q.qsize() < 2:
+                    await q.put(silence)
+            except Exception:
+                pass
+            await asyncio.sleep(0.1)
+
+    async def _spawn_ffmpeg(self, chat_id: int, rtmp_url: str) -> None:
         cmd = [
             self.ffmpeg_bin,
             "-hide_banner",
             "-loglevel",
             "warning",
             "-nostdin",
-            "-f",
-            "lavfi",
-            "-i",
-            f"color=c=black:s={self.video_size}:r={self.fps}",
             "-f",
             "s16le",
             "-ar",
@@ -146,57 +170,63 @@ class TelegramToTikTokBridge:
             str(self.output_channels),
             "-i",
             "pipe:0",
-            "-shortest",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-tune",
-            "zerolatency",
-            "-pix_fmt",
-            "yuv420p",
+            "-vn",
             "-c:a",
             "aac",
             "-b:a",
             f"{self.audio_bitrate_kbps}k",
-            "-ar",
-            str(self.output_sample_rate),
-            "-ac",
-            str(self.output_channels),
             "-f",
             "flv",
             rtmp_url,
         ]
-        self._ffmpeg = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
+        log.info("[TT] spawn ffmpeg chat_id=%s cmd=%s", chat_id, cmd)
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
         )
+        self._ffmpeg[chat_id] = proc
 
     async def _pump_ffmpeg(self, chat_id: int) -> None:
-        if not self._ffmpeg or not self._ffmpeg.stdin or not self._queue:
+        proc = self._ffmpeg.get(chat_id)
+        q = self._queues.get(chat_id)
+        if not proc or not proc.stdin or not q:
             return
+
         try:
             while True:
-                chunk = await self._queue.get()
-                if chunk is None:
+                st = self._get_state(chat_id)
+                if not st.active:
                     break
-                self._ffmpeg.stdin.write(chunk)
-                await self._ffmpeg.stdin.drain()
+                chunk = await q.get()
+                if not chunk:
+                    continue
+                try:
+                    proc.stdin.write(chunk)
+                    proc.stdin.flush()
+                except Exception as e:
+                    st.last_error = f"{type(e).__name__}: {e}"
+                    break
         except asyncio.CancelledError:
             raise
         except Exception as e:
             st = self._get_state(chat_id)
-            st.last_error = f"ffmpeg_pump_error: {type(e).__name__}: {e}"
-            st.status = "error"
+            st.last_error = f"{type(e).__name__}: {e}"
+        finally:
+            try:
+                if proc and proc.stdin:
+                    proc.stdin.close()
+            except Exception:
+                pass
 
     async def _drain_ffmpeg_stderr(self, chat_id: int) -> None:
-        if not self._ffmpeg or not self._ffmpeg.stderr:
+        proc = self._ffmpeg.get(chat_id)
+        if not proc or not proc.stderr:
             return
         try:
             while True:
-                line = await self._ffmpeg.stderr.readline()
+                line = await asyncio.to_thread(proc.stderr.readline)
                 if not line:
                     break
                 txt = line.decode("utf-8", "ignore").strip()
@@ -207,7 +237,7 @@ class TelegramToTikTokBridge:
         except Exception as e:
             log.warning("ffmpeg stderr drain failed: %s", e)
 
-    async def start(
+    async def _start_session(
         self,
         *,
         chat_id: int,
@@ -215,11 +245,16 @@ class TelegramToTikTokBridge:
         title: str = "",
         join_as: Any = None,
         invite_hash: str | None = None,
+        mode: str = "live",
+        bridge_enabled: bool = False,
     ) -> dict[str, Any]:
-        async with self._lock:
+        async with self._locks[int(chat_id)]:
             st = self._get_state(chat_id)
 
             if st.active:
+                if mode == "bridge_audio":
+                    st.mode = "bridge_audio"
+                    st.bridge_enabled = True
                 return {"ok": True, "state": st.public()}
 
             if not rtmp_url or not str(rtmp_url).startswith("rtmp"):
@@ -228,42 +263,30 @@ class TelegramToTikTokBridge:
                 return {"ok": False, "error": "missing_tiktok_rtmp_url"}
 
             self._loop = asyncio.get_running_loop()
-            self._queue = asyncio.Queue(maxsize=1000)
-            st.rtmp_url = rtmp_url
+            self._queues[chat_id] = asyncio.Queue(maxsize=2000)
             st.title = title or "TikTok Live"
-            st.mode = "bridge_audio"
+            st.source_url = ""
+            st.rtmp_url = rtmp_url
+            st.mode = mode
             st.status = "starting"
             st.last_error = ""
+            st.active = True
+            st.bridge_enabled = bridge_enabled
             st.started_at = time.time()
             st.last_seen_at = st.started_at
-            st.active = True
-
-            def on_played_data(_call, length: int) -> bytes:
-                return b"\x00" * max(0, int(length or 0))
-
-            def on_recorded_data(_call, frame: bytes, length: int) -> None:
-                if not self._loop:
-                    return
-                try:
-                    self._loop.call_soon_threadsafe(self._enqueue_audio, chat_id, frame, length)
-                except Exception:
-                    pass
-
-            self._group_call = self._factory.get_raw_group_call(
-                on_played_data=on_played_data,
-                on_recorded_data=on_recorded_data,
-                enable_logs_to_console=False,
-                outgoing_audio_bitrate_kbit=self.audio_bitrate_kbps,
-            )
+            st.join_as = join_as
+            st.invite_hash = invite_hash
 
             try:
-                await self._spawn_ffmpeg(rtmp_url)
-                st.ffmpeg_pid = int(getattr(self._ffmpeg, "pid", 0) or 0)
+                self._group_call[chat_id] = self._make_group_call(chat_id)
+                await self._spawn_ffmpeg(chat_id, rtmp_url)
+                st.ffmpeg_pid = int(getattr(self._ffmpeg.get(chat_id), "pid", 0) or 0)
 
-                self._writer_task = asyncio.create_task(self._pump_ffmpeg(chat_id))
-                self._stderr_task = asyncio.create_task(self._drain_ffmpeg_stderr(chat_id))
+                self._writer_task[chat_id] = asyncio.create_task(self._pump_ffmpeg(chat_id))
+                self._stderr_task[chat_id] = asyncio.create_task(self._drain_ffmpeg_stderr(chat_id))
+                self._silence_task[chat_id] = asyncio.create_task(self._feed_silence(chat_id))
 
-                await self._group_call.start(
+                await self._group_call[chat_id].start(
                     chat_id,
                     join_as=join_as,
                     invite_hash=invite_hash,
@@ -273,63 +296,141 @@ class TelegramToTikTokBridge:
                 st.status = "playing"
                 st.last_seen_at = time.time()
                 return {"ok": True, "state": st.public()}
-
             except Exception as e:
                 st.status = "error"
                 st.last_error = f"{type(e).__name__}: {e}"
                 await self.stop(chat_id)
                 return {"ok": False, "error": st.last_error}
 
+    async def start_live(
+        self,
+        *,
+        chat_id: int,
+        rtmp_url: str,
+        title: str = "",
+        join_as: Any = None,
+        invite_hash: str | None = None,
+    ) -> dict[str, Any]:
+        return await self._start_session(
+            chat_id=chat_id,
+            rtmp_url=rtmp_url,
+            title=title,
+            join_as=join_as,
+            invite_hash=invite_hash,
+            mode="live",
+            bridge_enabled=False,
+        )
+
+    async def enable_bridge(
+        self,
+        *,
+        chat_id: int,
+        rtmp_url: str,
+        title: str = "",
+        join_as: Any = None,
+        invite_hash: str | None = None,
+    ) -> dict[str, Any]:
+        async with self._locks[int(chat_id)]:
+            st = self._get_state(chat_id)
+            if not st.active:
+                return await self._start_session(
+                    chat_id=chat_id,
+                    rtmp_url=rtmp_url,
+                    title=title,
+                    join_as=join_as,
+                    invite_hash=invite_hash,
+                    mode="bridge_audio",
+                    bridge_enabled=True,
+                )
+
+            st.mode = "bridge_audio"
+            st.bridge_enabled = True
+            st.title = title or st.title or "TikTok Live"
+            st.rtmp_url = rtmp_url or st.rtmp_url
+            st.last_seen_at = time.time()
+            st.status = "playing"
+            return {"ok": True, "state": st.public()}
+
+    async def disable_bridge(self, chat_id: int) -> dict[str, Any]:
+        async with self._locks[int(chat_id)]:
+            st = self._get_state(chat_id)
+            if not st.active:
+                st.bridge_enabled = False
+                st.mode = "live"
+                return {"ok": True, "state": st.public()}
+
+            st.mode = "live"
+            st.bridge_enabled = False
+            st.last_seen_at = time.time()
+            st.status = "playing"
+            return {"ok": True, "state": st.public()}
+
+    async def start(
+        self,
+        *,
+        chat_id: int,
+        rtmp_url: str,
+        title: str = "",
+        join_as: Any = None,
+        invite_hash: str | None = None,
+        mode: str = "live",
+    ) -> dict[str, Any]:
+        if mode == "bridge_audio":
+            return await self.enable_bridge(
+                chat_id=chat_id,
+                rtmp_url=rtmp_url,
+                title=title,
+                join_as=join_as,
+                invite_hash=invite_hash,
+            )
+        return await self.start_live(
+            chat_id=chat_id,
+            rtmp_url=rtmp_url,
+            title=title,
+            join_as=join_as,
+            invite_hash=invite_hash,
+        )
+
     async def stop(self, chat_id: int) -> dict[str, Any]:
-        async with self._lock:
+        async with self._locks[int(chat_id)]:
             st = self._get_state(chat_id)
             st.active = False
+            st.bridge_enabled = False
             st.status = "stopping"
 
-            if self._writer_task:
-                self._writer_task.cancel()
-                self._writer_task = None
+            for task_map in (self._silence_task, self._writer_task, self._stderr_task):
+                task = task_map.get(chat_id)
+                if task:
+                    task.cancel()
+                    task_map[chat_id] = None
 
-            if self._stderr_task:
-                self._stderr_task.cancel()
-                self._stderr_task = None
-
-            if self._queue:
+            gc = self._group_call.get(chat_id)
+            if gc:
                 try:
-                    self._queue.put_nowait(b"")
-                except Exception:
-                    pass
-                self._queue = None
+                    stop_fn = getattr(gc, "stop", None) or getattr(gc, "leave", None) or getattr(gc, "disconnect", None)
+                    if stop_fn:
+                        maybe = stop_fn()
+                        if asyncio.iscoroutine(maybe):
+                            await maybe
+                except Exception as e:
+                    st.last_error = f"{type(e).__name__}: {e}"
 
-            try:
-                if self._group_call:
-                    stop_fn = getattr(self._group_call, "stop", None)
-                    if callable(stop_fn):
-                        await stop_fn()
-                    else:
-                        leave_fn = getattr(self._group_call, "leave_current_group_call", None)
-                        if callable(leave_fn):
-                            await leave_fn()
-            except Exception as e:
-                st.last_error = f"group_call_stop_error: {type(e).__name__}: {e}"
-
-            self._group_call = None
-
-            if self._ffmpeg:
+            proc = self._ffmpeg.get(chat_id)
+            if proc:
                 try:
-                    if self._ffmpeg.stdin:
-                        self._ffmpeg.stdin.close()
-                except Exception:
-                    pass
-                try:
-                    await asyncio.wait_for(self._ffmpeg.wait(), timeout=10)
+                    proc.terminate()
+                    await asyncio.to_thread(proc.wait, 5)
                 except Exception:
                     try:
-                        self._ffmpeg.kill()
+                        proc.kill()
                     except Exception:
                         pass
-                self._ffmpeg = None
+
+            self._ffmpeg[chat_id] = None
+            self._group_call[chat_id] = None
+            self._queues.pop(chat_id, None)
 
             st.status = "idle"
+            st.last_seen_at = time.time()
             st.ffmpeg_pid = 0
             return {"ok": True, "state": st.public()}
