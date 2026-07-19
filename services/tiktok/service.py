@@ -3,19 +3,25 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from typing import Any
+import re
+from typing import Any, Mapping
 
+from bridge import TelegramToTikTokBridge
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 
-from bridge import create_bridge, TelegramToTikTokBridge
-from player import create_player, TikTokPlayer
-from receiver import receiver
-from session import sessions
-from config import settings
-
 log = logging.getLogger("tiktok.service")
-cfg = settings()
+
+
+def _s(v: Any) -> str:
+    return str(v or "").strip()
+
+
+def _i(v: Any, default: int) -> int:
+    try:
+        return int(str(v).strip())
+    except Exception:
+        return default
 
 
 class TikTokService:
@@ -25,7 +31,6 @@ class TikTokService:
         self._booted = False
         self._boot_lock = asyncio.Lock()
         self.client: TelegramClient | None = None
-        self.player: TikTokPlayer | None = None
         self.bridge: TelegramToTikTokBridge | None = None
 
     async def boot(self) -> None:
@@ -36,9 +41,9 @@ class TikTokService:
             if self._booted:
                 return
 
-            api_id = cfg.api_id
-            api_hash = cfg.api_hash
-            session_string = cfg.session_string
+            api_id = _s(os.getenv("API_ID"))
+            api_hash = _s(os.getenv("API_HASH"))
+            session_string = _s(os.getenv("SESSION_STRING"))
 
             if not api_id or not api_hash or not session_string:
                 self.ready = False
@@ -55,151 +60,168 @@ class TikTokService:
                 )
                 await self.client.start()
 
-                self.player = create_player(self.client)
-                self.bridge = create_bridge(self.client)
+                self.bridge = TelegramToTikTokBridge(
+                    self.client,
+                    ffmpeg_bin=_s(os.getenv("FFMPEG_BIN")) or "ffmpeg",
+                    video_size=_s(os.getenv("TIKTOK_VIDEO_SIZE")) or "1280x720",
+                    fps=_i(os.getenv("TIKTOK_FPS"), 30),
+                    audio_bitrate_kbps=_i(os.getenv("TIKTOK_AUDIO_BITRATE"), 128),
+                    output_sample_rate=_i(os.getenv("TIKTOK_SAMPLE_RATE"), 48000),
+                    output_channels=_i(os.getenv("TIKTOK_CHANNELS"), 2),
+                )
 
                 self.ready = True
                 self.backend_error = ""
                 self._booted = True
-                log.info("TikTok service booted successfully")
+                log.info("TikTok service booted")
             except Exception as e:
                 self.ready = False
                 self.backend_error = f"{type(e).__name__}: {e}"
                 self._booted = True
                 log.exception("TikTok service boot failed")
 
-    def _chat_id(self, payload: dict[str, Any]) -> int:
-        raw = payload.get("chatId") or payload.get("chat_id") or 0
-        return int(raw)
+    def _payload(self, payload: Any) -> dict[str, Any]:
+        return payload if isinstance(payload, dict) else {}
 
-    def _rtmp_url(self, payload: dict[str, Any]) -> str:
-        rtmp = str(payload.get("rtmp_url") or "").strip()
-        if rtmp:
-            return rtmp
-        env_url = str(os.getenv("TIKTOK_RTMP_URL") or "").strip()
+    def _chat_id(self, payload: Mapping[str, Any] | dict[str, Any]) -> int | None:
+        p = payload if isinstance(payload, dict) else dict(payload or {})
+        for key in ("chatId", "chat_id", "chat_id_"):
+            raw = _s(p.get(key))
+            if raw and re.fullmatch(r"-?\d+", raw):
+                try:
+                    return int(raw)
+                except Exception:
+                    return None
+        return None
+
+    def _mode(self, payload: Mapping[str, Any] | dict[str, Any]) -> str:
+        p = payload if isinstance(payload, dict) else dict(payload or {})
+        return _s(p.get("mode")) or "live"
+
+    def _rtmp_url(self, payload: Mapping[str, Any] | dict[str, Any]) -> str:
+        p = payload if isinstance(payload, dict) else dict(payload or {})
+
+        source_url = _s(p.get("source_url"))
+        rtmp_url = _s(p.get("rtmp_url"))
+        env_url = _s(os.getenv("TIKTOK_RTMP_URL"))
+
+        if rtmp_url:
+            return rtmp_url
         if env_url:
             return env_url
-        source = str(payload.get("source_url") or "").strip()
-        if source.startswith("rtmp"):
-            return source
+        if source_url.startswith("rtmp://") or source_url.startswith("rtmps://"):
+            return source_url
         return ""
 
     async def start(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """
-        يبدأ دائماً بنقل بث تيك توك → مكالمة تليجرام (فيديو + صوت)
-        """
-        await self.boot()
-        if not self.ready or not self.player:
-            return {"ok": False, "error": f"service_not_ready: {self.backend_error}"}
-
-        chat_id = self._chat_id(payload)
-        source_url = str(payload.get("source_url") or "").strip()
-        title = str(payload.get("title") or "TikTok Live").strip()
-        join_as = payload.get("join_as")
-        invite_hash = str(payload.get("invite_hash") or "") or None
-
-        if not source_url:
-            return {"ok": False, "error": "missing_source_url"}
-
-        # 1. استخراج روابط البث من تيك توك
-        resolved = await receiver.resolve(chat_id=chat_id, url=source_url)
-        if not resolved.get("ok"):
-            return {"ok": False, "error": resolved.get("error") or "resolve_failed"}
-
-        video_url = resolved["video_url"]
-        audio_url = resolved.get("audio_url") or video_url
-        final_title = resolved.get("title") or title
-
-        s = sessions.get(chat_id)
-        s.source_url = source_url
-        s.title = final_title
-        s.join_as = join_as
-        s.invite_hash = invite_hash
-        s.touch()
-
-        # 2. تشغيل البث داخل مكالمة تليجرام (المكتبة القديمة)
-        result = await self.player.start(
-            chat_id=chat_id,
-            video_url=video_url,
-            audio_url=audio_url,
-            title=final_title,
-            join_as=join_as,
-            invite_hash=invite_hash,
-        )
-
-        if not result.get("ok"):
-            return result
-
-        return {
-            "ok": True,
-            "state": sessions.get(chat_id).public(),
-            "resolved": {
-                "title": final_title,
-                "thumbnail": resolved.get("thumbnail") or "",
-                "uploader": resolved.get("uploader") or "",
-            },
-        }
-
-    async def bridge_enable(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """
-        تفعيل الجسر العكسي: صوت مكالمة تليجرام → تيك توك
-        (يعمل فوق طبقة الفيديو الحالية)
-        """
         await self.boot()
         if not self.ready or not self.bridge:
-            return {"ok": False, "error": f"service_not_ready: {self.backend_error}"}
+            return {"ok": False, "error": f"service_not_ready: {self.backend_error or 'missing_env'}"}
 
-        chat_id = self._chat_id(payload)
+        chat_id = self._chat_id(self._payload(payload))
+        if chat_id is None:
+            return {"ok": False, "error": "invalid_chat_id"}
+
+        title = _s(payload.get("title")) or "TikTok Live"
+        mode = self._mode(payload)
+        join_as = payload.get("join_as")
+        invite_hash = _s(payload.get("invite_hash")) or None
         rtmp_url = self._rtmp_url(payload)
-        title = str(payload.get("title") or sessions.get(chat_id).title or "TikTok Live")
 
         if not rtmp_url:
             return {"ok": False, "error": "missing_tiktok_rtmp_url"}
 
-        result = await self.bridge.enable(
+        if mode == "bridge_audio":
+            return await self.bridge.enable_bridge(
+                chat_id=chat_id,
+                rtmp_url=rtmp_url,
+                title=title,
+                join_as=join_as,
+                invite_hash=invite_hash,
+            )
+
+        return await self.bridge.start_live(
             chat_id=chat_id,
             rtmp_url=rtmp_url,
             title=title,
-            join_as=payload.get("join_as"),
-            invite_hash=str(payload.get("invite_hash") or "") or None,
+            join_as=join_as,
+            invite_hash=invite_hash,
         )
-        return result
+
+    async def bridge_enable(self, payload: dict[str, Any]) -> dict[str, Any]:
+        await self.boot()
+        if not self.ready or not self.bridge:
+            return {"ok": False, "error": f"service_not_ready: {self.backend_error or 'missing_env'}"}
+
+        chat_id = self._chat_id(self._payload(payload))
+        if chat_id is None:
+            return {"ok": False, "error": "invalid_chat_id"}
+
+        title = _s(payload.get("title")) or "TikTok Live"
+        join_as = payload.get("join_as")
+        invite_hash = _s(payload.get("invite_hash")) or None
+        rtmp_url = self._rtmp_url(payload)
+
+        if not rtmp_url:
+            return {"ok": False, "error": "missing_tiktok_rtmp_url"}
+
+        return await self.bridge.enable_bridge(
+            chat_id=chat_id,
+            rtmp_url=rtmp_url,
+            title=title,
+            join_as=join_as,
+            invite_hash=invite_hash,
+        )
 
     async def bridge_disable(self, payload: dict[str, Any]) -> dict[str, Any]:
         await self.boot()
         if not self.ready or not self.bridge:
-            return {"ok": False, "error": f"service_not_ready: {self.backend_error}"}
+            return {"ok": False, "error": f"service_not_ready: {self.backend_error or 'missing_env'}"}
 
-        chat_id = self._chat_id(payload)
-        return await self.bridge.disable(chat_id)
+        chat_id = self._chat_id(self._payload(payload))
+        if chat_id is None:
+            return {"ok": False, "error": "invalid_chat_id"}
+
+        return await self.bridge.disable_bridge(chat_id)
 
     async def stop(self, payload: dict[str, Any]) -> dict[str, Any]:
         await self.boot()
-        chat_id = self._chat_id(payload)
+        if not self.ready or not self.bridge:
+            return {"ok": False, "error": f"service_not_ready: {self.backend_error or 'missing_env'}"}
 
-        # إيقاف الجسر أولاً
-        if self.bridge:
-            await self.bridge.disable(chat_id)
+        chat_id = self._chat_id(self._payload(payload))
+        if chat_id is None:
+            return {"ok": False, "error": "invalid_chat_id"}
 
-        # ثم إيقاف مشغل الفيديو
-        if self.player:
-            await self.player.stop(chat_id)
-
-        sessions.reset(chat_id)
-        return {"ok": True, "state": sessions.get(chat_id).public()}
+        return await self.bridge.stop(chat_id)
 
     async def state(self, payload: dict[str, Any]) -> dict[str, Any]:
         await self.boot()
-        chat_id = self._chat_id(payload)
-        return {"ok": True, "state": sessions.get(chat_id).public()}
+        if not self.ready or not self.bridge:
+            return {"ok": False, "error": f"service_not_ready: {self.backend_error or 'missing_env'}"}
+
+        chat_id = self._chat_id(self._payload(payload))
+        if chat_id is None:
+            return {"ok": False, "error": "invalid_chat_id"}
+
+        return {"ok": True, "state": self.bridge.state(chat_id)}
 
     async def meta(self, payload: dict[str, Any]) -> dict[str, Any]:
-        source_url = str(payload.get("source_url") or "").strip()
-        if not source_url:
-            return {"ok": False, "error": "missing_source_url"}
+        p = self._payload(payload)
 
-        meta = await receiver.metadata(source_url)
-        return meta
+        title = _s(p.get("title")) or _s(p.get("source_url")) or "TikTok Live"
+        source_url = _s(p.get("source_url"))
+
+        return {
+            "ok": True,
+            "state": {
+                "title": title,
+                "source_url": source_url,
+                "mode": _s(p.get("mode")) or "live",
+                "duration": _i(p.get("duration"), 0),
+                "viewers": _i(p.get("viewers"), 0),
+            },
+        }
 
 
 service = TikTokService()
