@@ -27,7 +27,7 @@ async def _json(req: Request) -> dict[str, Any]:
     except Exception:
         return {}
 
-
+@app.get("/health")
 @app.get("/healthz")
 async def healthz():
     return {"ok": True, "ready": service.ready, "error": service.backend_error}
