@@ -30,6 +30,13 @@ async def _json(req: Request) -> dict[str, Any]:
     except Exception:
         return {}
 
+@app.get("/ping")
+@app.post("/ping")
+async def ping(
+    x_keepalive_secret: str | None = Header(default=None, alias="x-keepalive-secret"),
+):
+    _guard(x_keepalive_secret)
+    return {"ok": True}
 
 @app.get("/health")
 @app.get("/healthz")
