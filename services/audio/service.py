@@ -6,7 +6,7 @@ import os
 import re
 import tempfile
 from collections import deque
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Deque
 
@@ -22,10 +22,9 @@ except Exception:  # pragma: no cover
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("audio_service")
 
-ALLOWED_SOURCE_TYPES = {"telegram", "telegram_file_id", "telegram_audio", "telegram_video", "file_id", "video_id"}
+ALLOWED_SOURCE_TYPES = {"telegram_file_id", "telegram_audio", "telegram_video", "file_id", "video_id", "telegram_message"}
 AUDIO_EXTS = {".mp3", ".ogg", ".oga", ".wav", ".m4a", ".aac", ".flac", ".opus"}
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".webm", ".m4v", ".avi"}
-
 
 @dataclass
 class AudioSession:
@@ -34,6 +33,8 @@ class AudioSession:
     title: str = ""
     source_type: str = ""
     source_id: str = ""
+    source_chat_id: str = ""
+    source_message_id: str = ""
     duration: int = 0
     offset: int = 0
     paused: bool = False
@@ -42,21 +43,20 @@ class AudioSession:
     video: bool = False
     updated_at: float = 0.0
 
-
 @dataclass
 class QueueItem:
     chat_id: int
     source_type: str
     source_id: str
+    source_chat_id: str = ""
+    source_message_id: str = ""
     title: str = ""
     duration: int = 0
     requested_by: str = ""
     auto_start: bool = True
     video: bool = False
-
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
-
 
 class AudioService:
     def __init__(self) -> None:
@@ -64,7 +64,6 @@ class AudioService:
         self.api_hash = os.getenv("API_HASH", "").strip()
         self.session_string = os.getenv("SESSION_STRING", "").strip()
         self.bot_token = os.getenv("BOT_TOKEN", "").strip()
-
         self.ready = False
         self.backend_error = ""
         self._client: TelegramClient | None = None
@@ -107,12 +106,16 @@ class AudioService:
             raise ValueError("unsupported_source_type")
         return st
 
-    def _infer_video(self, source_type: str, file_name: str) -> bool:
+    def _infer_video(self, source_type: str, file_name: str = "", mime_type: str = "") -> bool:
         st = self._normalize_source_type(source_type)
         suffix = Path(file_name).suffix.lower()
         if st in {"telegram_video", "video_id"}:
             return True
-        if st in {"telegram_audio"}:
+        if st == "telegram_audio":
+            return False
+        if mime_type.startswith("video/"):
+            return True
+        if mime_type.startswith("audio/"):
             return False
         if suffix in VIDEO_EXTS:
             return True
@@ -138,11 +141,9 @@ class AudioService:
     async def _download_telegram_file(self, file_id: str, source_type: str, title: str = "") -> tuple[Path, bool]:
         if not self.bot_token:
             raise RuntimeError("missing_env: BOT_TOKEN")
-
         info = await self._http_get_json(f"https://api.telegram.org/bot{self.bot_token}/getFile", params={"file_id": file_id})
         if not info.get("ok"):
             raise RuntimeError(f"telegram_getFile_failed: {info}")
-
         file_path = str(info["result"]["file_path"])
         original_name = Path(file_path).name or (title.strip() or file_id)
         video = self._infer_video(source_type, original_name)
@@ -152,6 +153,24 @@ class AudioService:
         content = await self._http_get_bytes(f"https://api.telegram.org/file/bot{self.bot_token}/{file_path}")
         local_path.write_bytes(content)
         return local_path, video
+
+    async def _download_telegram_message(self, source_chat_id: int, source_message_id: int, source_type: str, title: str = "") -> tuple[Path, bool]:
+        if not self._client:
+            raise RuntimeError("missing_telegram_client")
+        if not source_chat_id or not source_message_id:
+            raise RuntimeError("missing_source_message_reference")
+        msg = await self._client.get_messages(int(source_chat_id), ids=int(source_message_id))
+        if not msg or not getattr(msg, "media", None):
+            raise RuntimeError("telegram_message_not_found")
+        mime_type = str(getattr(getattr(msg, "file", None), "mime_type", "") or "").lower()
+        file_name = str(getattr(getattr(msg, "file", None), "name", "") or "")
+        video = bool(getattr(msg, "video", None)) or self._infer_video(source_type, file_name, mime_type)
+        stem = re.sub(r"[^A-Za-z0-9._-]+", "_", (title or file_name or f"{source_chat_id}_{source_message_id}"))[:120]
+        local_hint = self._download_dir / stem
+        local_file = await self._client.download_media(msg, file=str(local_hint))
+        if not local_file:
+            raise RuntimeError("telegram_download_failed")
+        return Path(local_file), video
 
     async def _call_any(self, obj: Any, method_names: list[str], *args: Any, **kwargs: Any) -> bool:
         if obj is None:
@@ -177,10 +196,8 @@ class AudioService:
             self.ready = False
             self.backend_error = "missing_env: API_ID/API_HASH/SESSION_STRING"
             return
-
         if self._client is None:
             self._client = TelegramClient(StringSession(self.session_string), self.api_id, self.api_hash)
-
         try:
             if not self._client.is_connected():
                 await self._client.connect()
@@ -241,6 +258,8 @@ class AudioService:
                 "title": s.title,
                 "source_type": s.source_type,
                 "source_id": s.source_id,
+                "source_chat_id": s.source_chat_id,
+                "source_message_id": s.source_message_id,
                 "duration": s.duration,
                 "offset": s.offset,
                 "paused": s.paused,
@@ -271,13 +290,7 @@ class AudioService:
 
         targets: list[Any] = []
         if self.calls is not None:
-            targets.extend([
-                self.calls,
-                getattr(self.calls, "group_call", None),
-                getattr(self.calls, "_group_call", None),
-                getattr(self.calls, "mtproto", None),
-                getattr(self.calls, "_call", None),
-            ])
+            targets.extend([self.calls, getattr(self.calls, "group_call", None), getattr(self.calls, "_group_call", None), getattr(self.calls, "mtproto", None), getattr(self.calls, "_call", None)])
 
         for obj in targets:
             if not obj:
@@ -302,22 +315,23 @@ class AudioService:
                 return True
             except Exception as exc:
                 logger.debug("client disconnect fallback failed: %s", exc)
-
         return False
 
-    async def meta(self, chat_id: int, source_type: str, source_id: str, title: str = "", duration: int = 0) -> dict[str, Any]:
+    async def meta(self, chat_id: int, source_type: str, source_id: str, title: str = "", duration: int = 0, source_chat_id: int = 0, source_message_id: int = 0) -> dict[str, Any]:
         await self.ensure_ready()
         st = self._normalize_source_type(source_type)
         s = self._sessions.get(chat_id) or AudioSession(chat_id=chat_id)
         s.title = title
         s.source_type = st
         s.source_id = source_id
+        s.source_chat_id = str(source_chat_id or "")
+        s.source_message_id = str(source_message_id or "")
         s.duration = int(duration or 0)
         s.video = st in {"telegram_video", "video_id"}
         self._sessions[chat_id] = self._touch(s)
         return {"ok": True, "action": "meta", "state": self.state(chat_id)}
 
-    async def start(self, chat_id: int, source_type: str, source_id: str, title: str = "", duration: int = 0, offset: int = 0) -> dict[str, Any]:
+    async def start(self, chat_id: int, source_type: str, source_id: str, title: str = "", duration: int = 0, offset: int = 0, source_chat_id: int = 0, source_message_id: int = 0) -> dict[str, Any]:
         await self.ensure_ready()
         st = self._normalize_source_type(source_type)
         s = self._sessions.get(chat_id) or AudioSession(chat_id=chat_id)
@@ -330,7 +344,10 @@ class AudioService:
 
         local_path = ""
         try:
-            path_obj, video = await self._download_telegram_file(source_id, st, title)
+            if st == "telegram_message":
+                path_obj, video = await self._download_telegram_message(source_chat_id, source_message_id, st, title)
+            else:
+                path_obj, video = await self._download_telegram_file(source_id, st, title)
             local_path = str(path_obj)
 
             try:
@@ -355,6 +372,8 @@ class AudioService:
             s.title = title
             s.source_type = st
             s.source_id = source_id
+            s.source_chat_id = str(source_chat_id or s.source_chat_id or "")
+            s.source_message_id = str(source_message_id or s.source_message_id or "")
             s.duration = int(duration or 0)
             s.offset = int(offset or 0)
             s.paused = False
@@ -379,7 +398,6 @@ class AudioService:
             s.last_error = self.backend_error or "service_not_ready"
             self._sessions[chat_id] = self._touch(s)
             return {"ok": False, "action": "pause", "error": "service_not_ready", "detail": self.backend_error, "state": self.state(chat_id)}
-
         try:
             paused = False
             if self.calls is not None:
@@ -402,7 +420,6 @@ class AudioService:
             s.last_error = self.backend_error or "service_not_ready"
             self._sessions[chat_id] = self._touch(s)
             return {"ok": False, "action": "resume", "error": "service_not_ready", "detail": self.backend_error, "state": self.state(chat_id)}
-
         try:
             resumed = False
             if self.calls is not None:
@@ -421,7 +438,6 @@ class AudioService:
         await self.ensure_ready()
         if not self.ready:
             return {"ok": False, "action": "seek", "error": "service_not_ready", "detail": self.backend_error, "state": self.state(chat_id)}
-
         try:
             moved = False
             if self.calls is not None:
@@ -439,7 +455,6 @@ class AudioService:
         try:
             async with self._lock:
                 stopped = await self._stop_backend(chat_id)
-
             s.status = "stopped"
             s.paused = False
             s.last_error = "" if stopped else "backend_stop_noop"
@@ -460,20 +475,16 @@ class AudioService:
             self._queues.pop(chat_id, None)
             return {"ok": False, "action": "stop", "error": type(exc).__name__, "detail": str(exc), "state": self.state(chat_id)}
 
-    async def enqueue(self, chat_id: int, source_type: str, source_id: str, title: str = "", duration: int = 0, requested_by: str = "", auto_start: bool = True) -> dict[str, Any]:
+    async def enqueue(self, chat_id: int, source_type: str, source_id: str, title: str = "", duration: int = 0, requested_by: str = "", auto_start: bool = True, source_chat_id: int = 0, source_message_id: int = 0) -> dict[str, Any]:
         await self.ensure_ready()
         st = self._normalize_source_type(source_type)
-        item = QueueItem(chat_id=chat_id, source_type=st, source_id=source_id, title=title, duration=int(duration or 0), requested_by=requested_by, auto_start=bool(auto_start), video=st in {"telegram_video", "video_id"})
+        item = QueueItem(chat_id=chat_id, source_type=st, source_id=source_id, source_chat_id=str(source_chat_id or ""), source_message_id=str(source_message_id or ""), title=title, duration=int(duration or 0), requested_by=requested_by, auto_start=bool(auto_start), video=st in {"telegram_video", "video_id"})
         q = self._queue(chat_id)
         q.append(item)
         if auto_start and self._sessions.get(chat_id, AudioSession(chat_id)).status in {"idle", "stopped", "error"}:
-            start_result = await self.start(chat_id, source_type, source_id, title=title, duration=duration, offset=0)
+            start_result = await self.start(chat_id, source_type, source_id, title=title, duration=duration, offset=0, source_chat_id=source_chat_id, source_message_id=source_message_id)
             return {"ok": True, "action": "enqueue", "queued": True, "auto_started": True, "start_result": start_result, "queue_length": len(q), "state": self.state(chat_id)}
         return {"ok": True, "action": "enqueue", "queued": True, "queue_length": len(q), "state": self.state(chat_id)}
-
-    async def queue_list(self, chat_id: int) -> dict[str, Any]:
-        q = self._queue(chat_id)
-        return {"ok": True, "action": "queue_list", "queue": [item.to_dict() for item in q], "state": self.state(chat_id)}
 
     async def queue_list(self, chat_id: int) -> dict[str, Any]:
         q = self._queue(chat_id)
@@ -492,7 +503,6 @@ class AudioService:
         if not q:
             return await self.stop(chat_id)
         nxt = q[0]
-        return await self.start(chat_id, nxt.source_type, nxt.source_id, title=nxt.title, duration=nxt.duration, offset=0)
-
+        return await self.start(chat_id, nxt.source_type, nxt.source_id, title=nxt.title, duration=nxt.duration, offset=0, source_chat_id=int(nxt.source_chat_id or 0), source_message_id=int(nxt.source_message_id or 0))
 
 service = AudioService()
