@@ -238,8 +238,10 @@ class AudioService:
             return
         try:
             await asyncio.to_thread(Path(path).unlink, missing_ok=True)
-        except Exception:
-            pass
+        except FileNotFoundError:
+            return
+        except Exception as exc:
+            logger.warning("audio_file_cleanup_failed path=%s error=%s", path, exc)
 
     async def _cleanup_download_dir(self) -> None:
         try:
