@@ -595,20 +595,31 @@ class AudioService:
             self._sessions[chat_id] = self._touch(session)
             return {"ok": False, "action": "resume", "error": type(exc).__name__, "detail": str(exc), "state": self.state(chat_id)}
 
-    async def seek(self, chat_id: int, delta: int = 0) -> dict[str, Any]:
+    async def seek(self, chat_id: int, delta: int = 0, position: int | None = None) -> dict[str, Any]:
         await self.ensure_ready()
         if not self.ready:
-            return {"ok": False, "action": "seek", "error": "service_not_ready", "state": self.state(chat_id)}
-        try:
-            result = await self._call_any(self.calls, ["seek"], chat_id, int(delta))
-            if not result:
-                raise RuntimeError("seek_method_failed")
-            session = self._sessions.get(chat_id) or AudioSession(chat_id=chat_id)
-            session.position = max(0, int(session.position or 0) + int(delta or 0))
-            self._sessions[chat_id] = self._touch(session)
-            return {"ok": True, "action": "seek", "moved": True, "state": self.state(chat_id)}
-        except Exception as exc:
-            return {"ok": False, "action": "seek", "error": type(exc).__name__, "detail": str(exc), "state": self.state(chat_id)}
+            return {"ok":False,"action":"seek","error":"service_not_ready","state":self.state(chat_id)}
+        async with self._lock_for(chat_id):
+            session=self._sessions.get(chat_id) or AudioSession(chat_id=chat_id)
+            try:
+                move=int(delta or 0)
+                result=await self._call_any(self.calls,["seek"],chat_id,move)
+                if not result:
+                    raise RuntimeError("seek_method_failed")
+                if position is None:
+                    position=max(0,int(session.position or 0)+move)
+                else:
+                    position=max(0,int(position))
+                if session.duration:
+                    position=min(position,int(session.duration))
+                session.position=position
+                self._sessions[chat_id]=self._touch(session)
+                return {"ok":True,"action":"seek","moved":bool(move),"position":position,"state":self.state(chat_id)}
+            except Exception as exc:
+                session.last_error=f"{type(exc).__name__}: {exc}"
+                self._sessions[chat_id]=self._touch(session)
+                logger.exception("audio seek failed chat_id=%s",chat_id)
+                return {"ok":False,"action":"seek","error":type(exc).__name__,"detail":str(exc),"state":self.state(chat_id)}
 
     async def stop(self, chat_id: int) -> dict[str, Any]:
         await self.ensure_ready()
