@@ -486,7 +486,7 @@ class AudioService:
                 session.status = "error"
                 session.last_error = f"{type(exc).__name__}: {exc}"
                 if local_path:
-                    session.local_path = local_path
+                    await self._cleanup_file(local_path)
                 self._sessions[chat_id] = self._touch(session)
                 logger.exception("audio start failed chat_id=%s", chat_id)
                 return {
