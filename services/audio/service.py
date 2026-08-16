@@ -262,7 +262,11 @@ class AudioService:
                 result = fn(*args, **kwargs)
                 await self._maybe_await(result)
                 return True
-            except TypeError:
+            except TypeError as exc:
+                logger.debug("audio_method_type_error method=%s error=%s", name, exc)
+                continue
+            except Exception as exc:
+                logger.exception("audio_method_failed method=%s error=%s", name, exc)
                 continue
         return False
 
