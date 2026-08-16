@@ -618,14 +618,16 @@ class AudioService:
                 self._sessions.pop(chat_id, None)
                 self._locks.pop(chat_id, None)
                 return {
-                    "ok": left,
+                    "ok": True,
                     "action": "stop",
-                    "stopped": left,
+                    "stopped": True,
+                    "left_call": bool(left),
                     "state": self.state(chat_id),
                 }
             except Exception as exc:
                 logger.exception("audio stop failed chat_id=%s", chat_id)
                 self._sessions.pop(chat_id, None)
+                self._locks.pop(chat_id, None)
                 return {
                     "ok": False,
                     "action": "stop",
