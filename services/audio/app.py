@@ -284,14 +284,19 @@ async def seek(req: Request, x_keepalive_secret: str | None = Header(default=Non
     _guard(x_keepalive_secret)
     body = await _json(req)
     try:
-        delta = int(_pick(body, "delta", default=0) or 0)
+        delta=int(_pick(body,"delta",default=0) or 0)
     except Exception:
-        delta = 0
+        delta=0
     try:
-        return await service.seek(_chat_id(body), delta)
+        raw_position=_pick(body,"position",default=None)
+        position=None if raw_position is None else max(0,int(raw_position or 0))
+    except Exception:
+        position=None
+    try:
+        return await service.seek(_chat_id(body),delta,position=position)
     except Exception as exc:
         logger.exception("seek_failed")
-        return {"ok": False, "action": "seek", "error": f"{type(exc).__name__}: {exc}"}
+        return {"ok":False,"action":"seek","error":f"{type(exc).__name__}: {exc}"}
 
 
 if __name__ == "__main__":  # pragma: no cover
