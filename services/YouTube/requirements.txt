@@ -1,0 +1,5 @@
+fastapi
+uvicorn[standard]
+telethon==1.44.0
+py-tgcalls==2.3.3
+yt-dlp[default,curl-cffi]==2026.7.4
