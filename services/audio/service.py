@@ -273,34 +273,32 @@ class AudioService:
         return False
 
     async def ensure_ready(self) -> None:
-        if self.ready:
-            return
-        if not self.api_id or not self.api_hash or not self.session_string:
-            self.ready = False
-            self.backend_error = "missing_env: API_ID/API_HASH/SESSION_STRING"
-            return
-        if PyTgCalls is None:
-            self.ready = False
-            self.backend_error = "pytgcalls_import_failed"
-            return
-
-        if self._client is None:
-            self._client = TelegramClient(StringSession(self.session_string), self.api_id, self.api_hash)
-
-        try:
-            await self._cleanup_download_dir()
-            if not self._client.is_connected():
-                await self._client.connect()
-            if self.calls is None:
-                self.calls = PyTgCalls(self._client)
-                await self._maybe_await(self.calls.start())
-            self.ready = True
-            self.backend_error = ""
-            logger.info("audio service ready")
-        except Exception as exc:
-            self.ready = False
-            self.backend_error = f"{type(exc).__name__}: {exc}"
-            logger.exception("audio service init failed")
+    if not self.api_id or not self.api_hash or not self.session_string:
+        self.ready = False
+        self.backend_error = "missing_env: API_ID/API_HASH/SESSION_STRING"
+        return
+    if PyTgCalls is None:
+        self.ready = False
+        self.backend_error = "pytgcalls_import_failed"
+        return
+    if self._client is None:
+        self._client = TelegramClient(StringSession(self.session_string), self.api_id, self.api_hash)
+    try:
+        if not self._client.is_connected():
+            logger.warning("mtproto_reconnect")
+            await self._client.connect()
+        if not self._client.is_connected():
+            raise RuntimeError("mtproto_connect_failed")
+        if self.calls is None:
+            self.calls = PyTgCalls(self._client)
+            await self._maybe_await(self.calls.start())
+        self.ready = True
+        self.backend_error = ""
+        logger.info("audio service ready connected=%s calls=%s",self._client.is_connected(),self.calls is not None)
+    except Exception as exc:
+        self.ready = False
+        self.backend_error = f"{type(exc).__name__}: {exc}"
+        logger.exception("audio service init failed")
 
     async def close(self) -> None:
         try:
