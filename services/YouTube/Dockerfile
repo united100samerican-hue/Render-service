@@ -7,5 +7,5 @@ COPY services/YouTube/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 COPY services/__init__.py /app/services/__init__.py
 COPY services/YouTube /app/services/YouTube
-EXPOSE 8000
-CMD ["uvicorn","services.YouTube:app","--host","0.0.0.0","--port","8000"]
+EXPOSE 10000
+CMD ["sh","-c","uvicorn services.YouTube.app:app --host 0.0.0.0 --port ${PORT:-10000}"]
