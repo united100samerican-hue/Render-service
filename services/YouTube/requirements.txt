@@ -1,7 +1,7 @@
 fastapi
 uvicorn[standard]
 telethon==1.44.0
-pytgcalls[telethon]==2.1.0
-yt-dlp[default,curl-cffi]==2025.10.14
+py-tgcalls==2.3.3
+yt-dlp[default,curl-cffi]==2026.7.4
 yt-dlp-ejs==0.8.0
 httpx
