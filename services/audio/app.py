@@ -25,8 +25,8 @@ def cid(b):
 def stype(b):
     raw=str(pick(b,'sourceType','source_type',default='')).strip().lower().replace('-','_')
     if raw in {'link','url','youtube','yt','youtube_video'}:return 'url'
-    if raw in {'audio','voice','music','song'}:return 'telegram_audio'
-    if raw in {'video','clip','movie'}:return 'telegram_video'
+    if raw in {'audio','voice','music','song','telegram_audio'}:return 'telegram_audio'
+    if raw in {'video','clip','movie','telegram_video'}:return 'telegram_video'
     if raw in {'telegram','tg','telegram_file_id','telegram_document','document','file','media','file_id'}:return 'telegram_file_id'
     if raw=='telegram_message':return raw
     raise HTTPException(400,f'unsupported_source_type: {raw or "missing"}')
@@ -73,7 +73,7 @@ async def call_state(req:Request,x_keepalive_secret:str|None=Header(default=None
 @app.post('/meta')
 async def meta(req:Request,x_keepalive_secret:str|None=Header(default=None,alias='x-keepalive-secret')):
     guard(x_keepalive_secret);b=await body(req);c=cid(b)
-    try:return await service.meta(c,stype(b),sid(b),title=title(b),duration=intval(b,'duration'),source_chat_id=scid(b),source_message_id=smid(b))
+    try:return await service.meta(c,stype(b),sid(b),title=title(b),source_chat_id=scid(b),source_message_id=smid(b))
     except Exception as e:log.exception('meta_failed chat_id=%s',c);return err_response('meta',e,c)
 @app.post('/start')
 async def start(req:Request,x_keepalive_secret:str|None=Header(default=None,alias='x-keepalive-secret')):
@@ -98,7 +98,7 @@ async def enqueue(req:Request,x_keepalive_secret:str|None=Header(default=None,al
 async def queue(req:Request,x_keepalive_secret:str|None=Header(default=None,alias='x-keepalive-secret')):
     guard(x_keepalive_secret);return await service.queue_list(cid(await body(req)))
 @app.post('/queue/list')
-async def queue_list(req:Request,x_keepalive_secret:str|None=Header(default=None,alias='x_keepalive-secret')):return await queue(req,x_keepalive_secret)
+async def queue_list(req:Request,x_keepalive_secret:str|None=Header(default=None,alias='x-keepalive-secret')):return await queue(req,x_keepalive_secret)
 @app.post('/queue/clear')
 async def queue_clear(req:Request,x_keepalive_secret:str|None=Header(default=None,alias='x-keepalive-secret')):
     guard(x_keepalive_secret);return await service.queue_clear(cid(await body(req)))
