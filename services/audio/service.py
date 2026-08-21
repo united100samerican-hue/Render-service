@@ -40,28 +40,17 @@ class AudioService:
             try:
                 await client.connect()
                 if not await client.is_user_authorized():
-                    await client.disconnect()
-                    self.backend_error='session_not_authorized'
-                    raise RuntimeError(self.backend_error)
-                calls=CallManager(client)
-                await calls.start()
-                media=TelegramMedia(BOT_TOKEN,client,self.root)
+                    await client.disconnect();self.backend_error='session_not_authorized';raise RuntimeError(self.backend_error)
+                calls=CallManager(client);await calls.start();media=TelegramMedia(BOT_TOKEN,client,self.root)
             except AuthKeyDuplicatedError as e:
                 try:await client.disconnect()
                 except Exception:pass
-                self.backend_error='auth_key_duplicated'
-                raise AudioServiceError('auth_key_duplicated',str(e)) from e
+                self.backend_error='auth_key_duplicated';raise AudioServiceError('auth_key_duplicated',str(e)) from e
             except Exception as e:
                 try:await client.disconnect()
                 except Exception:pass
-                self.backend_error=f'{type(e).__name__}: {e}'
-                raise
-            self.client=client
-            self.calls=calls
-            self.telegram_media=media
-            self.ready=True
-            self.backend_error=''
-            log.info('ready')
+                self.backend_error=f'{type(e).__name__}: {e}';raise
+            self.client=client;self.calls=calls;self.telegram_media=media;self.ready=True;self.backend_error='';log.info('ready')
     async def close(self):
         for chat_id in list(self.sessions):
             try:
@@ -73,6 +62,11 @@ class AudioService:
             try:await self.client.disconnect()
             except Exception:pass
         self.client=None;self.calls=None;self.telegram_media=None;self.ready=False
+        self._clean_all()
+    def _clean_all(self):
+        try:
+            for p in self.root.glob('*'):p.unlink(missing_ok=True)
+        except Exception:pass
     def state(self,chat_id:int)->dict[str,Any]:
         s=self.sessions.get(int(chat_id))
         return {'ok':True,'ready':self.ready,'active':bool(s and s.status in {'playing','paused'}),'state':s.to_dict() if s else {'chat_id':int(chat_id),'status':'idle'}}
@@ -92,16 +86,16 @@ class AudioService:
         if st=='telegram_message':
             if not self.telegram_media:raise RuntimeError('telegram_media_not_ready')
             path,video,kind=await self.telegram_media.from_message(source_chat_id or chat_id,source_message_id,title)
-            return {'source_type':st,'source_id':source_id,'stream_url':str(path),'title':title or path.stem,'duration':0,'webpage_url':'','thumbnail':'','video':video,'media_kind':kind,'local_path':str(path)}
+            return {'source_type':st,'source_id':source_id,'stream_url':str(path),'title':title or path.stem,'duration':0,'webpage_url':'','thumbnail':'','video':video,'media_kind':kind,'local_path':str(path),'live':False}
         if st in {'telegram_audio','telegram_video','telegram_file_id','file_id'}:
             if not self.telegram_media:raise RuntimeError('telegram_media_not_ready')
             path,video,kind=await self.telegram_media.from_file_id(source_id,st,title)
-            return {'source_type':st,'source_id':source_id,'stream_url':str(path),'title':title or path.stem,'duration':0,'webpage_url':'','thumbnail':'','video':video,'media_kind':kind,'local_path':str(path)}
+            return {'source_type':st,'source_id':source_id,'stream_url':str(path),'title':title or path.stem,'duration':0,'webpage_url':'','thumbnail':'','video':video,'media_kind':kind,'local_path':str(path),'live':False}
         raise RuntimeError(f'unsupported_source_type: {source_type}')
     async def meta(self,chat_id:int,source_type:str,source_id:str,**kw)->dict[str,Any]:
         await self.ensure_ready()
         async with self.lock(chat_id):
-            r=await self._resolve(chat_id,source_type,source_id,**kw)
+            r=await self._resolve(chat_id,source_type,source_id,title=str(kw.get('title') or ''),source_chat_id=int(kw.get('source_chat_id') or 0),source_message_id=int(kw.get('source_message_id') or 0))
             local=str(r.get('local_path') or '')
             try:
                 return {'ok':True,'action':'meta','state':{'chat_id':chat_id,'source_type':str(r.get('source_type') or source_type),'source_id':str(r.get('source_id') or source_id),'title':str(r.get('title') or kw.get('title') or 'غير معروف'),'duration':int(r.get('duration') or kw.get('duration') or 0),'video':bool(r.get('video')),'media_kind':str(r.get('media_kind') or ('video' if r.get('video') else 'audio')),'webpage_url':str(r.get('webpage_url') or r.get('source_url') or source_id),'source_url':str(r.get('source_url') or source_id),'thumbnail':str(r.get('thumbnail') or ''),'live':bool(r.get('live',False))}}
@@ -121,19 +115,17 @@ class AudioService:
         if old and old.local_path and old.local_path!=new_path:self._clean_file(old.local_path)
         stream=str(r.get('stream_url') or '')
         if not stream:
-            self._clean_file(new_path)
-            raise RuntimeError('stream_url_missing')
+            self._clean_file(new_path);raise RuntimeError('stream_url_missing')
         try:
-            await self.calls.play(chat_id,stream)
+            await self.calls.play(chat_id,stream,bool(r.get('video')),int(offset or 0))
         except AuthKeyDuplicatedError as e:
             self._clean_file(new_path);self.backend_error='auth_key_duplicated';raise AudioServiceError('auth_key_duplicated',str(e)) from e
         except Exception as e:
-            self._clean_file(new_path)
-            msg=str(e)
+            self._clean_file(new_path);msg=str(e)
             if 'NoActiveGroupCall' in msg or 'No active group call' in msg or 'GROUPCALL_INVALID' in msg:raise AudioServiceError('no_active_call','no_active_call') from e
             raise
         now=self._now()
-        s=AudioSession(chat_id,status='playing',title=str(r.get('title') or title or source_id),source_type=str(r.get('source_type') or source_type),source_id=str(r.get('source_id') or source_id),source_chat_id=str(source_chat_id or ''),source_message_id=str(source_message_id or ''),source_url=str(r.get('source_url') or source_id if str(source_type)=='url' else ''),duration=int(r.get('duration') or duration or 0),position=max(0,int(offset or 0)),started_at=now-max(0,int(offset or 0)),video=bool(r.get('video')),media_kind=str(r.get('media_kind') or ('video' if r.get('video') else 'audio')),thumbnail=str(r.get('thumbnail') or ''),webpage_url=str(r.get('webpage_url') or source_id),local_path=new_path,updated_at=now)
+        s=AudioSession(chat_id,status='playing',title=str(r.get('title') or title or source_id),source_type=str(r.get('source_type') or source_type),source_id=str(r.get('source_id') or source_id),source_chat_id=str(source_chat_id or ''),source_message_id=str(source_message_id or ''),source_url=str(r.get('source_url') or source_id if str(source_type)=='url' else ''),duration=int(r.get('duration') or duration or 0),position=max(0,int(offset or 0)),started_at=now-max(0,int(offset or 0)),video=bool(r.get('video')),media_kind=str(r.get('media_kind') or ('video' if r.get('video') else 'audio')),live=bool(r.get('live',False)),thumbnail=str(r.get('thumbnail') or ''),webpage_url=str(r.get('webpage_url') or source_id),local_path=new_path,updated_at=now)
         self.sessions[chat_id]=s
         return {'ok':True,'action':'start','state':s.to_dict()}
     async def start(self,chat_id:int,source_type:str,source_id:str,**kw):
@@ -145,8 +137,7 @@ class AudioService:
             error=None
             try:
                 if self.calls:await self.calls.stop(chat_id)
-            except Exception as e:
-                error=e
+            except Exception as e:error=e
             finally:
                 if s:self._clean_file(s.local_path)
                 self.sessions.pop(chat_id,None)
@@ -171,10 +162,20 @@ class AudioService:
         async with self.lock(chat_id):
             s=self.sessions.get(chat_id)
             if not s or s.status not in {'playing','paused'}:return {'ok':False,'action':'seek','error':'no_active_audio','state':self.state(chat_id)}
+            if s.live:return {'ok':False,'action':'seek','error':'seek_not_supported_live','state':self.state(chat_id)}
             current=s.position if s.status=='paused' else max(0,int(self._now()-s.started_at));target=max(0,current+int(delta))
             if s.duration>0:target=min(target,s.duration)
-            await self.calls.seek(chat_id,target);s.position=target;s.updated_at=self._now()
-            if s.status=='playing':s.started_at=s.updated_at-target
+            if target==current:return {'ok':True,'action':'seek','position':target,'state':s.to_dict()}
+            source=s.local_path
+            if not source and s.source_type=='url' and s.source_url:
+                r=await self.urls.resolve(s.source_url)
+                if r.get('live'):return {'ok':False,'action':'seek','error':'seek_not_supported_live','state':self.state(chat_id)}
+                source=str(r.get('stream_url') or '')
+                if r.get('duration'):s.duration=int(r['duration'])
+            if not source:return {'ok':False,'action':'seek','error':'seek_source_unavailable','state':self.state(chat_id)}
+            await self.calls.seek(chat_id,source,target)
+            now=self._now();s.position=target;s.updated_at=now
+            if s.status=='playing':s.started_at=now-target
             return {'ok':True,'action':'seek','position':target,'state':s.to_dict()}
     async def enqueue(self,chat_id,source_type,source_id,**kw):return {'ok':True,'action':'enqueue','state':self.state(chat_id)}
     async def queue_list(self,chat_id):return {'ok':True,'action':'queue_list','queue':[],'state':self.state(chat_id)}

@@ -7,7 +7,7 @@ from fastapi.responses import PlainTextResponse
 from service import service
 logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(name)s: %(message)s')
 log=logging.getLogger('audio_app')
-app=FastAPI(title='Render Audio+URL Service',version='6.1')
+app=FastAPI(title='Render Audio+URL Service',version='6.2')
 SECRET=os.getenv('KEEPALIVE_SECRET','').strip()
 def guard(value:str|None):
     if SECRET and (value or '').strip()!=SECRET:raise HTTPException(403,'forbidden')
@@ -98,7 +98,7 @@ async def enqueue(req:Request,x_keepalive_secret:str|None=Header(default=None,al
 async def queue(req:Request,x_keepalive_secret:str|None=Header(default=None,alias='x-keepalive-secret')):
     guard(x_keepalive_secret);return await service.queue_list(cid(await body(req)))
 @app.post('/queue/list')
-async def queue_list(req:Request,x_keepalive_secret:str|None=Header(default=None,alias='x-keepalive-secret')):return await queue(req,x_keepalive_secret)
+async def queue_list(req:Request,x_keepalive_secret:str|None=Header(default=None,alias='x_keepalive_secret')):return await queue(req,x_keepalive_secret)
 @app.post('/queue/clear')
 async def queue_clear(req:Request,x_keepalive_secret:str|None=Header(default=None,alias='x-keepalive-secret')):
     guard(x_keepalive_secret);return await service.queue_clear(cid(await body(req)))
