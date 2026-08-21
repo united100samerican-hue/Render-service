@@ -10,27 +10,27 @@ import httpx
 import yt_dlp
 from config import YOUTUBE_COOKIES
 VIDEO_EXTS={'.mp4','.mkv','.mov','.webm','.m4v','.avi','.m3u8','.mpd','.ts','.m2ts'}
-AUDIO_EXTS={'.mp3','.ogg','.oga','.wav','.m4a','.aac','.flac','.opus','.aac'}
+AUDIO_EXTS={'.mp3','.ogg','.oga','.wav','.m4a','.aac','.flac','.opus'}
 class UrlResolver:
     def __init__(self):
         self._timeout=30
         self._cookie_file=''
         self._prepare_cookies()
     def _prepare_cookies(self):
-    raw=str(YOUTUBE_COOKIES or '').strip()
-    if not raw:return
-    text=raw
-    if raw.startswith('base64:'):
-        try:text=base64.b64decode(raw[7:]).decode('utf-8')
-        except Exception:return
-    if not text.startswith('# Netscape HTTP Cookie File') and '\n' not in text and '\r' not in text:return
-    try:
-        fd,path=tempfile.mkstemp(prefix='youtube_cookies_',suffix='.txt')
-        os.close(fd)
-        Path(path).write_text(text,encoding='utf-8')
-        self._cookie_file=path
-    except Exception:
-        self._cookie_file=''
+        raw=str(YOUTUBE_COOKIES or '').strip()
+        if not raw:return
+        text=raw
+        if raw.startswith('base64:'):
+            try:text=base64.b64decode(raw[7:]).decode('utf-8')
+            except Exception:return
+        if not text.startswith('# Netscape HTTP Cookie File') and '\n' not in text and '\r' not in text:return
+        try:
+            fd,path=tempfile.mkstemp(prefix='youtube_cookies_',suffix='.txt')
+            os.close(fd)
+            Path(path).write_text(text,encoding='utf-8')
+            self._cookie_file=path
+        except Exception:
+            self._cookie_file=''
     @staticmethod
     def _is_direct(url:str,content_type:str='')->tuple[bool,str,bool]:
         u=str(url or '').strip().lower()
@@ -71,3 +71,4 @@ class UrlResolver:
         direct,kind,live=self._is_direct(url,content_type)
         if direct:return {'source_url':url,'stream_url':final_url or url,'title':url,'duration':0,'webpage_url':url,'thumbnail':'','video':kind=='video','media_kind':kind,'live':live}
         return await asyncio.to_thread(self._extract,url)
+            
