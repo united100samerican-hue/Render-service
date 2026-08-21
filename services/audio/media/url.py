@@ -17,23 +17,20 @@ class UrlResolver:
         self._cookie_file=''
         self._prepare_cookies()
     def _prepare_cookies(self):
-        raw=YOUTUBE_COOKIES
-        if not raw:return
-        p=Path(raw)
-        if p.is_file():
-            self._cookie_file=str(p)
-            return
-        text=raw
-        if raw.startswith('base64:'):
-            try:text=base64.b64decode(raw[7:]).decode()
-            except Exception:return
-        if not text.startswith('# Netscape HTTP Cookie File') and '\n' not in text:return
-        try:
-            fd,path=tempfile.mkstemp(prefix='youtube_cookies_',suffix='.txt')
-            os.close(fd)
-            Path(path).write_text(text,encoding='utf-8')
-            self._cookie_file=path
-        except Exception:self._cookie_file=''
+    raw=str(YOUTUBE_COOKIES or '').strip()
+    if not raw:return
+    text=raw
+    if raw.startswith('base64:'):
+        try:text=base64.b64decode(raw[7:]).decode('utf-8')
+        except Exception:return
+    if not text.startswith('# Netscape HTTP Cookie File') and '\n' not in text and '\r' not in text:return
+    try:
+        fd,path=tempfile.mkstemp(prefix='youtube_cookies_',suffix='.txt')
+        os.close(fd)
+        Path(path).write_text(text,encoding='utf-8')
+        self._cookie_file=path
+    except Exception:
+        self._cookie_file=''
     @staticmethod
     def _is_direct(url:str,content_type:str='')->tuple[bool,str,bool]:
         u=str(url or '').strip().lower()
