@@ -49,7 +49,15 @@ class UrlResolver:
                 return str(r.headers.get('content-type','')),str(r.url)
         except Exception:return '',url
     def _extract(self,url:str)->dict[str,Any]:
-        opts={'quiet':True,'no_warnings':True,'skip_download':True,'noplaylist':True,'geo_bypass':True,'format':'best[ext=mp4][vcodec!=none][acodec!=none]/best[vcodec!=none][acodec!=none]/best[acodec!=none]/best'}
+        opts={
+            'quiet':True,
+            'no_warnings':True,
+            'skip_download':True,
+            'noplaylist':True,
+            'geo_bypass':True,
+            'extractor_args':{'youtube':{'player_client':['default','web_embedded']}},
+            'format':'best[ext=mp4][vcodec!=none][acodec!=none]/best[vcodec!=none][acodec!=none]/best[acodec!=none]/best'
+        }
         if self._cookie_file:opts['cookiefile']=self._cookie_file
         with yt_dlp.YoutubeDL(opts) as ydl:
             info=ydl.extract_info(url,download=False)
@@ -71,4 +79,3 @@ class UrlResolver:
         direct,kind,live=self._is_direct(url,content_type)
         if direct:return {'source_url':url,'stream_url':final_url or url,'title':url,'duration':0,'webpage_url':url,'thumbnail':'','video':kind=='video','media_kind':kind,'live':live}
         return await asyncio.to_thread(self._extract,url)
-            
