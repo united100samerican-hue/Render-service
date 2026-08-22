@@ -1,81 +1,403 @@
 from __future__ import annotations
+
 import asyncio
 import base64
-import mimetypes
 import os
 import tempfile
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
+
 import httpx
 import yt_dlp
+
 from config import YOUTUBE_COOKIES
-VIDEO_EXTS={'.mp4','.mkv','.mov','.webm','.m4v','.avi','.m3u8','.mpd','.ts','.m2ts'}
-AUDIO_EXTS={'.mp3','.ogg','.oga','.wav','.m4a','.aac','.flac','.opus'}
+
+
+VIDEO_EXTS = {
+    ".mp4",
+    ".mkv",
+    ".mov",
+    ".webm",
+    ".m4v",
+    ".avi",
+    ".m3u8",
+    ".mpd",
+    ".ts",
+    ".m2ts",
+}
+
+AUDIO_EXTS = {
+    ".mp3",
+    ".ogg",
+    ".oga",
+    ".wav",
+    ".m4a",
+    ".aac",
+    ".flac",
+    ".opus",
+}
+
+YOUTUBE_HOSTS = {
+    "youtube.com",
+    "www.youtube.com",
+    "m.youtube.com",
+    "music.youtube.com",
+    "youtu.be",
+    "www.youtu.be",
+}
+
+SEARCH_PREFIXES = (
+    "ytsearch:",
+    "ytsearch1:",
+    "ytsearch2:",
+    "ytsearch3:",
+)
+
+
 class UrlResolver:
     def __init__(self):
-        self._timeout=30
-        self._cookie_file=''
+        self._timeout = 30
+        self._cookie_file = ""
         self._prepare_cookies()
+
     def _prepare_cookies(self):
-        raw=str(YOUTUBE_COOKIES or '').strip()
-        if not raw:return
-        text=raw
-        if raw.startswith('base64:'):
-            try:text=base64.b64decode(raw[7:]).decode('utf-8')
-            except Exception:return
-        if not text.startswith('# Netscape HTTP Cookie File') and '\n' not in text and '\r' not in text:return
+        raw = str(YOUTUBE_COOKIES or "").strip()
+
+        if not raw:
+            return
+
+        text = raw
+
+        if raw.startswith("base64:"):
+            try:
+                text = base64.b64decode(raw[7:]).decode("utf-8")
+            except Exception:
+                return
+
+        if (
+            not text.startswith("# Netscape HTTP Cookie File")
+            and "\n" not in text
+            and "\r" not in text
+        ):
+            return
+
         try:
-            fd,path=tempfile.mkstemp(prefix='youtube_cookies_',suffix='.txt')
+            fd, path = tempfile.mkstemp(
+                prefix="youtube_cookies_",
+                suffix=".txt",
+            )
+
             os.close(fd)
-            Path(path).write_text(text,encoding='utf-8')
-            self._cookie_file=path
+
+            Path(path).write_text(
+                text,
+                encoding="utf-8",
+            )
+
+            self._cookie_file = path
+
         except Exception:
-            self._cookie_file=''
+            self._cookie_file = ""
+
     @staticmethod
-    def _is_direct(url:str,content_type:str='')->tuple[bool,str,bool]:
-        u=str(url or '').strip().lower()
-        ct=content_type.lower().split(';',1)[0].strip()
-        ext=Path(url.split('?',1)[0]).suffix.lower()
-        if u.startswith(('rtmp://','rtmps://','rtsp://')):return True,'video',True
-        if ct.startswith('video/') or ext in VIDEO_EXTS:return True,'video',ext in {'.m3u8','.mpd'}
-        if ct.startswith('audio/') or ext in AUDIO_EXTS:return True,'audio',False
-        if 'mpegurl' in ct or 'dash+xml' in ct:return True,'video',True
-        return False,'audio',False
-    async def _head(self,url:str)->tuple[str,str]:
-        if not str(url).lower().startswith(('http://','https://')):return '',url
+    def _is_youtube_url(value: str) -> bool:
+        raw = str(value or "").strip()
+
+        if not raw.lower().startswith(
+            ("http://", "https://")
+        ):
+            return False
+
         try:
-            async with httpx.AsyncClient(timeout=self._timeout,follow_redirects=True) as c:
-                r=await c.head(url,headers={'User-Agent':'Mozilla/5.0'})
-                return str(r.headers.get('content-type','')),str(r.url)
-        except Exception:return '',url
-    def _extract(self,url:str)->dict[str,Any]:
-        opts={
-            'quiet':True,
-            'no_warnings':True,
-            'skip_download':True,
-            'noplaylist':True,
-            'geo_bypass':True,
-            'extractor_args':{'youtube':{'player_client':['default','web_embedded']}},
-            'format':'best[ext=mp4][vcodec!=none][acodec!=none]/best[vcodec!=none][acodec!=none]/best[acodec!=none]/best'
+            host = str(
+                urlsplit(raw).hostname or ""
+            ).lower().rstrip(".")
+        except Exception:
+            return False
+
+        return host in YOUTUBE_HOSTS
+
+    @staticmethod
+    def _is_youtube_search(value: str) -> bool:
+        return str(value or "").strip().lower().startswith(
+            SEARCH_PREFIXES
+        )
+
+    @staticmethod
+    def _is_direct(
+        url: str,
+        content_type: str = "",
+    ) -> tuple[bool, str, bool]:
+
+        u = str(url or "").strip().lower()
+
+        ct = (
+            content_type
+            .lower()
+            .split(";", 1)[0]
+            .strip()
+        )
+
+        ext = Path(
+            url.split("?", 1)[0]
+        ).suffix.lower()
+
+        if u.startswith(
+            ("rtmp://", "rtmps://", "rtsp://")
+        ):
+            return True, "video", True
+
+        if (
+            ct.startswith("video/")
+            or ext in VIDEO_EXTS
+        ):
+            return (
+                True,
+                "video",
+                ext in {".m3u8", ".mpd"},
+            )
+
+        if (
+            ct.startswith("audio/")
+            or ext in AUDIO_EXTS
+        ):
+            return True, "audio", False
+
+        if (
+            "mpegurl" in ct
+            or "dash+xml" in ct
+        ):
+            return True, "video", True
+
+        return False, "audio", False
+
+    async def _head(
+        self,
+        url: str,
+    ) -> tuple[str, str]:
+
+        if not str(url).lower().startswith(
+            ("http://", "https://")
+        ):
+            return "", url
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=self._timeout,
+                follow_redirects=True,
+            ) as client:
+
+                response = await client.head(
+                    url,
+                    headers={
+                        "User-Agent": "Mozilla/5.0"
+                    },
+                )
+
+                return (
+                    str(
+                        response.headers.get(
+                            "content-type",
+                            "",
+                        )
+                    ),
+                    str(response.url),
+                )
+
+        except Exception:
+            return "", url
+
+    def _extract(
+        self,
+        source: str,
+    ) -> dict[str, Any]:
+
+        options = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "noplaylist": True,
+            "geo_bypass": True,
+            "extractor_args": {
+                "youtube": {
+                    "player_client": [
+                        "default",
+                        "web_embedded",
+                    ]
+                }
+            },
+            "format": (
+                "best[ext=mp4]"
+                "[vcodec!=none]"
+                "[acodec!=none]"
+                "/best[vcodec!=none]"
+                "[acodec!=none]"
+                "/best[acodec!=none]"
+                "/best"
+            ),
         }
-        if self._cookie_file:opts['cookiefile']=self._cookie_file
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info=ydl.extract_info(url,download=False)
-            if info and info.get('entries'):info=next((x for x in info['entries'] if x),None)
-            if not info:raise RuntimeError('url_metadata_empty')
-            stream=str(info.get('url') or '')
+
+        if self._cookie_file:
+            options["cookiefile"] = self._cookie_file
+
+        is_search = self._is_youtube_search(
+            source
+        )
+
+        with yt_dlp.YoutubeDL(options) as ydl:
+
+            info = ydl.extract_info(
+                source,
+                download=False,
+            )
+
+            if info and info.get("entries"):
+                info = next(
+                    (
+                        entry
+                        for entry in info["entries"]
+                        if entry
+                    ),
+                    None,
+                )
+
+            if not info:
+                raise RuntimeError(
+                    "url_metadata_empty"
+                )
+
+            stream = str(
+                info.get("url") or ""
+            )
+
             if not stream:
-                formats=[f for f in(info.get('formats') or []) if f.get('url')]
-                if not formats:raise RuntimeError('url_stream_not_found')
-                formats.sort(key=lambda f:(f.get('height') or 0,f.get('tbr') or 0),reverse=True)
-                stream=str(formats[0]['url'])
-            vcodec=str(info.get('vcodec') or '')
-            kind='video' if vcodec and vcodec!='none' else 'audio'
-            return {'source_url':url,'stream_url':stream,'title':str(info.get('title') or url),'duration':int(info.get('duration') or 0),'webpage_url':str(info.get('webpage_url') or url),'thumbnail':str(info.get('thumbnail') or ''),'video':kind=='video','media_kind':kind,'live':bool(info.get('is_live'))}
-    async def resolve(self,url:str)->dict[str,Any]:
-        url=str(url or '').strip()
-        if not url:raise RuntimeError('url_missing')
-        content_type,final_url=await self._head(url)
-        direct,kind,live=self._is_direct(url,content_type)
-        if direct:return {'source_url':url,'stream_url':final_url or url,'title':url,'duration':0,'webpage_url':url,'thumbnail':'','video':kind=='video','media_kind':kind,'live':live}
-        return await asyncio.to_thread(self._extract,url)
+                formats = [
+                    item
+                    for item in (
+                        info.get("formats")
+                        or []
+                    )
+                    if item.get("url")
+                ]
+
+                if not formats:
+                    raise RuntimeError(
+                        "url_stream_not_found"
+                    )
+
+                formats.sort(
+                    key=lambda item: (
+                        item.get("height") or 0,
+                        item.get("tbr") or 0,
+                    ),
+                    reverse=True,
+                )
+
+                stream = str(
+                    formats[0]["url"]
+                )
+
+            webpage_url = str(
+                info.get("webpage_url")
+                or info.get("original_url")
+                or ""
+            ).strip()
+
+            title = str(
+                info.get("title") or ""
+            ).strip()
+
+            if not title:
+                raise RuntimeError(
+                    "url_title_missing"
+                )
+
+            if not webpage_url:
+
+                if is_search:
+                    raise RuntimeError(
+                        "search_result_url_missing"
+                    )
+
+                webpage_url = str(
+                    source
+                ).strip()
+
+            vcodec = str(
+                info.get("vcodec") or ""
+            )
+
+            kind = (
+                "video"
+                if vcodec and vcodec != "none"
+                else "audio"
+            )
+
+            return {
+                "source_url": webpage_url,
+                "stream_url": stream,
+                "title": title,
+                "duration": int(
+                    info.get("duration") or 0
+                ),
+                "webpage_url": webpage_url,
+                "thumbnail": str(
+                    info.get("thumbnail") or ""
+                ),
+                "video": kind == "video",
+                "media_kind": kind,
+                "live": bool(
+                    info.get("is_live")
+                ),
+            }
+
+    async def resolve(
+        self,
+        url: str,
+    ) -> dict[str, Any]:
+
+        source = str(url or "").strip()
+
+        if not source:
+            raise RuntimeError(
+                "url_missing"
+            )
+
+        # YouTube and ytsearch must always
+        # go through yt-dlp.
+        if (
+            self._is_youtube_search(source)
+            or self._is_youtube_url(source)
+        ):
+            return await asyncio.to_thread(
+                self._extract,
+                source,
+            )
+
+        content_type, final_url = await self._head(
+            source
+        )
+
+        direct, kind, live = self._is_direct(
+            source,
+            content_type,
+        )
+
+        if direct:
+            return {
+                "source_url": source,
+                "stream_url": final_url or source,
+                "title": source,
+                "duration": 0,
+                "webpage_url": source,
+                "thumbnail": "",
+                "video": kind == "video",
+                "media_kind": kind,
+                "live": live,
+            }
+
+        return await asyncio.to_thread(
+            self._extract,
+            source,
+        )
