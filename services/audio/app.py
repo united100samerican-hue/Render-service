@@ -80,6 +80,13 @@ async def start(req:Request,x_keepalive_secret:str|None=Header(default=None,alia
     guard(x_keepalive_secret);b=await body(req);c=cid(b)
     try:return await service.start(c,stype(b),sid(b),title=title(b),duration=intval(b,'duration'),offset=intval(b,'offset'),source_chat_id=scid(b),source_message_id=smid(b))
     except Exception as e:log.exception('start_failed chat_id=%s',c);return err_response('start',e,c)
+for _action in ('next','skip'):
+    async def playlist_start(req:Request,x_keepalive_secret:str|None=Header(default=None,alias='x-keepalive-secret'),_a=_action):
+        guard(x_keepalive_secret);b=await body(req);c=cid(b)
+        try:return await service.start(c,stype(b),sid(b),title=title(b),duration=intval(b,'duration'),offset=intval(b,'offset'),source_chat_id=scid(b),source_message_id=smid(b))
+        except Exception as e:log.exception('%s_failed chat_id=%s',_a,c);return err_response(_a,e,c)
+    playlist_start.__name__=f'api_{_action}'
+    app.post(f'/{_action}')(playlist_start)
 for action in ('pause','resume','stop','seek'):
     async def endpoint(req:Request,x_keepalive_secret:str|None=Header(default=None,alias='x-keepalive-secret'),_a=action):
         guard(x_keepalive_secret);b=await body(req);c=cid(b)
