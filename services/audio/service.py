@@ -69,7 +69,16 @@ class AudioService:
         except Exception:pass
     def state(self,chat_id:int)->dict[str,Any]:
         s=self.sessions.get(int(chat_id))
-        return {'ok':True,'ready':self.ready,'active':bool(s and s.status in {'playing','paused'}),'state':s.to_dict() if s else {'chat_id':int(chat_id),'status':'idle'}}
+        if not s:return {'ok':True,'ready':self.ready,'active':False,'state':{'chat_id':int(chat_id),'status':'idle'}}
+        x=s.to_dict()
+        if s.status=='playing':
+            p=max(0,int(self._now()-s.started_at))
+            if s.duration>0:p=min(p,s.duration)
+            x['position']=p
+        elif s.status=='paused':
+            x['position']=max(0,int(s.position))
+        x['updated_at']=self._now()
+        return {'ok':True,'ready':self.ready,'active':s.status in {'playing','paused'},'state':x}
     async def call_state(self,chat_id:int)->dict[str,Any]:
         await self.ensure_ready()
         if not self.calls:raise RuntimeError('call_backend_not_ready')
