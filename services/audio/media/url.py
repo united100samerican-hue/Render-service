@@ -2,6 +2,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import os
+import shutil
 import tempfile
 import time
 from pathlib import Path
@@ -16,7 +17,7 @@ YOUTUBE_HOSTS={"youtube.com","www.youtube.com","m.youtube.com","music.youtube.co
 SEARCH_PREFIXES=("ytsearch:","ytsearch1:","ytsearch2:","ytsearch3:")
 class UrlResolver:
     def __init__(self):
-        self._timeout=8
+        self._timeout=20
         self._cache_ttl=90
         self._cache:dict[str,tuple[float,dict[str,Any]]]={}
         self._cookie_file=""
@@ -75,9 +76,11 @@ class UrlResolver:
                 return str(response.headers.get("content-type","")),str(response.url)
         except Exception:return "",url
     def _extract(self,source:str)->dict[str,Any]:
-        options={"quiet":True,"no_warnings":True,"skip_download":True,"noplaylist":True,"geo_bypass":True,"extractor_args":{"youtube":{"player_client":["default","web_embedded"]}},"format":"best[ext=mp4][vcodec!=none][acodec!=none]/best[vcodec!=none][acodec!=none]/best[acodec!=none]/best"}
+        is_youtube=self._is_youtube_search(source) or self._is_youtube_url(source)
+        options={"quiet":True,"no_warnings":True,"skip_download":True,"noplaylist":True,"ignoreerrors":False,"socket_timeout":20,"retries":3,"fragment_retries":3,"concurrent_fragment_downloads":4,"continuedl":True,"geo_bypass":True,"http_headers":{"User-Agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/140.0 Safari/537.36"},"extractor_args":{"youtube":{"player_client":["default","web_embedded"]}},"format":"bestaudio[ext=m4a]/bestaudio/best[acodec!=none]" if is_youtube else "best[ext=mp4][vcodec!=none][acodec!=none]/best[vcodec!=none][acodec!=none]/best[acodec!=none]/best"}
+        deno=shutil.which("deno") or ("/usr/local/bin/deno" if Path("/usr/local/bin/deno").is_file() else "")
+        if deno:options["js_runtimes"]={"deno":{"path":deno}}
         if self._cookie_file:options["cookiefile"]=self._cookie_file
-        is_search=self._is_youtube_search(source)
         with yt_dlp.YoutubeDL(options) as ydl:
             info=ydl.extract_info(source,download=False)
             if info and info.get("entries"):
@@ -87,16 +90,17 @@ class UrlResolver:
             if not stream:
                 formats=[item for item in (info.get("formats") or []) if item.get("url")]
                 if not formats:raise RuntimeError("url_stream_not_found")
-                formats.sort(key=lambda item:(item.get("height") or 0,item.get("tbr") or 0),reverse=True)
+                formats.sort(key=lambda item:(item.get("abr") or item.get("tbr") or 0,item.get("height") or 0),reverse=True)
                 stream=str(formats[0]["url"])
             webpage_url=str(info.get("webpage_url") or info.get("original_url") or "").strip()
             title=str(info.get("title") or "").strip()
             if not title:raise RuntimeError("url_title_missing")
             if not webpage_url:
-                if is_search:raise RuntimeError("search_result_url_missing")
+                if self._is_youtube_search(source):raise RuntimeError("search_result_url_missing")
                 webpage_url=str(source).strip()
             vcodec=str(info.get("vcodec") or "")
-            kind="video" if vcodec and vcodec!="none" else "audio"
+            acodec=str(info.get("acodec") or "")
+            kind="video" if vcodec and vcodec!="none" and acodec and acodec!="none" else "audio"
             return {"source_url":webpage_url,"stream_url":stream,"title":title,"duration":int(info.get("duration") or 0),"webpage_url":webpage_url,"thumbnail":str(info.get("thumbnail") or ""),"video":kind=="video","media_kind":kind,"live":bool(info.get("is_live"))}
     async def resolve(self,url:str)->dict[str,Any]:
         source=str(url or "").strip()
@@ -111,7 +115,7 @@ class UrlResolver:
         final_url=source
         if not direct:
             content_type,final_url=await self._head(source)
-            direct,kind,live=self._is_direct(source,content_type)
+            direct,kind,live=self._is_direct(final_url,content_type)
         if direct:
             cached=self._cache_get(source)
             if cached:return cached
