@@ -30,6 +30,8 @@ class CallManager:
         await self.calls.pause(int(chat_id))
     async def resume(self,chat_id:int)->None:
         await self.calls.resume(int(chat_id))
+    async def set_muted(self,chat_id:int,muted:bool)->None:
+        await self.calls.change_volume_call(int(chat_id),0 if muted else 100)
     async def stop(self,chat_id:int)->None:
         try:await self.calls.leave_call(int(chat_id))
         except(NoActiveGroupCall,NotInCallError):return
