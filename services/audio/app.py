@@ -98,6 +98,11 @@ for action in ('pause','resume','stop','seek'):
         except Exception as e:log.exception('%s_failed chat_id=%s',_a,c);return err_response(_a,e,c)
     endpoint.__name__=f'api_{action}'
     app.post(f'/{action}')(endpoint)
+@app.post('/mute')
+async def mute(req:Request,x_keepalive_secret:str|None=Header(default=None,alias='x-keepalive-secret')):
+    guard(x_keepalive_secret);b=await body(req);c=cid(b);muted=bool(pick(b,'muted',default=False))
+    try:return await service.mute(c,muted)
+    except Exception as e:log.exception('mute_failed chat_id=%s',c);return err_response('mute',e,c)
 @app.post('/enqueue')
 async def enqueue(req:Request,x_keepalive_secret:str|None=Header(default=None,alias='x-keepalive-secret')):
     guard(x_keepalive_secret);b=await body(req);c=cid(b);return await service.enqueue(c,stype(b),sid(b),title=title(b),duration=intval(b,'duration'),requested_by=str(pick(b,'requestedBy','requested_by',default='')),auto_start=bool(pick(b,'autoStart','auto_start',default=False)),source_chat_id=scid(b),source_message_id=smid(b))

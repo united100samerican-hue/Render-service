@@ -394,22 +394,37 @@ class AudioService:
             raise RuntimeError("stream_url_missing")
 
         try:
-            await self.calls.play(
-                chat_id,
-                stream,
-                bool(result.get("video")),
-                int(offset or 0),
-            )
+            await self.calls.play(chat_id,stream,bool(result.get("video")),int(offset or 0))
         except AuthKeyDuplicatedError as e:
             self._clean_file(new_path)
             self.backend_error = "auth_key_duplicated"
             raise AudioServiceError("auth_key_duplicated", str(e)) from e
         except Exception as e:
-            self._clean_file(new_path)
             message = str(e)
-            if "NoActiveGroupCall" in message or "No active group call" in message or "GROUPCALL_INVALID" in message:
-                raise AudioServiceError("no_active_call", "no_active_call") from e
-            raise
+            is_url = str(source_type or "").strip().lower() in {"url","link","youtube","yt"}
+            if is_url and not any(x in message for x in ("NoActiveGroupCall","No active group call","GROUPCALL_INVALID","AuthKeyDuplicated")):
+                try:
+                    self.urls.invalidate(source_id)
+                    fresh = await self._resolve_url(source_id)
+                    fresh_stream = str(fresh.get("stream_url") or "")
+                    if not fresh_stream:raise RuntimeError("stream_url_missing")
+                    await self.calls.play(chat_id,fresh_stream,bool(fresh.get("video")),int(offset or 0))
+                    result = fresh
+                except AuthKeyDuplicatedError as retry_error:
+                    self._clean_file(new_path)
+                    self.backend_error = "auth_key_duplicated"
+                    raise AudioServiceError("auth_key_duplicated", str(retry_error)) from retry_error
+                except Exception as retry_error:
+                    self._clean_file(new_path)
+                    retry_message = str(retry_error)
+                    if "NoActiveGroupCall" in retry_message or "No active group call" in retry_message or "GROUPCALL_INVALID" in retry_message:
+                        raise AudioServiceError("no_active_call", "no_active_call") from retry_error
+                    raise
+            else:
+                self._clean_file(new_path)
+                if "NoActiveGroupCall" in message or "No active group call" in message or "GROUPCALL_INVALID" in message:
+                    raise AudioServiceError("no_active_call", "no_active_call") from e
+                raise
 
         now = self._now()
         safe_offset = max(0, int(offset or 0))
@@ -428,6 +443,7 @@ class AudioService:
             video=bool(result.get("video")),
             media_kind=str(result.get("media_kind") or ("video" if result.get("video") else "audio")),
             live=bool(result.get("live", False)),
+            muted=False,
             thumbnail=str(result.get("thumbnail") or ""),
             webpage_url=str(result.get("webpage_url") or source_id),
             local_path=new_path,
@@ -520,6 +536,19 @@ class AudioService:
             if session.status == "playing":
                 session.started_at = now - target
             return {"ok": True, "action": "seek", "position": target, "state": session.to_dict()}
+
+    async def mute(self, chat_id: int, muted: bool):
+        await self.ensure_ready()
+        async with self.lock(chat_id):
+            session = self.sessions.get(chat_id)
+            if not session or session.status not in {"playing","paused"}:
+                return {"ok":False,"action":"mute","error":"no_active_audio","state":self.state(chat_id)}
+            if not self.calls:
+                raise RuntimeError("call_backend_not_ready")
+            await self.calls.set_muted(chat_id,bool(muted))
+            session.muted=bool(muted)
+            session.updated_at=self._now()
+            return {"ok":True,"action":"mute","state":session.to_dict()}
 
     async def enqueue(self, chat_id, source_type, source_id, **kw):
         return {"ok": True, "action": "enqueue", "state": self.state(chat_id)}
