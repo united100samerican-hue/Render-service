@@ -30,6 +30,8 @@ class UrlResolver:
             self._cache.pop(source,None)
             return None
         return dict(value)
+    def invalidate(self,source:str)->None:
+        self._cache.pop(str(source or ""),None)
     def _cache_set(self,source:str,value:dict[str,Any])->None:
         self._cache[source]=(time.time(),dict(value))
         if len(self._cache)>128:
