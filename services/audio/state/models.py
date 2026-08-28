@@ -18,7 +18,6 @@ class AudioSession:
     video:bool=False
     media_kind:str='audio'
     live:bool=False
-    muted:bool=False
     thumbnail:str=''
     webpage_url:str=''
     last_error:str=''
