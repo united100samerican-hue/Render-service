@@ -443,7 +443,6 @@ class AudioService:
             video=bool(result.get("video")),
             media_kind=str(result.get("media_kind") or ("video" if result.get("video") else "audio")),
             live=bool(result.get("live", False)),
-            muted=False,
             thumbnail=str(result.get("thumbnail") or ""),
             webpage_url=str(result.get("webpage_url") or source_id),
             local_path=new_path,
@@ -500,55 +499,6 @@ class AudioService:
             session.paused_at = 0
             session.updated_at = now
             return {"ok": True, "action": "resume", "state": session.to_dict()}
-
-    async def seek(self, chat_id: int, delta: int):
-        await self.ensure_ready()
-        async with self.lock(chat_id):
-            session = self.sessions.get(chat_id)
-            if not session or session.status not in {"playing", "paused"}:
-                return {"ok": False, "action": "seek", "error": "no_active_audio", "state": self.state(chat_id)}
-            if session.live:
-                return {"ok": False, "action": "seek", "error": "seek_not_supported_live", "state": self.state(chat_id)}
-
-            current = session.position if session.status == "paused" else max(0, int(self._now() - session.started_at))
-            target = max(0, current + int(delta))
-            if session.duration > 0:
-                target = min(target, session.duration)
-            if target == current:
-                return {"ok": True, "action": "seek", "position": target, "state": session.to_dict()}
-
-            source = session.local_path
-            if not source and session.source_type == "url" and session.source_url:
-                result = await self._resolve_url(session.source_url)
-                if result.get("live"):
-                    return {"ok": False, "action": "seek", "error": "seek_not_supported_live", "state": self.state(chat_id)}
-                source = str(result.get("stream_url") or "")
-                if result.get("duration"):
-                    session.duration = int(result["duration"])
-
-            if not source:
-                return {"ok": False, "action": "seek", "error": "seek_source_unavailable", "state": self.state(chat_id)}
-
-            await self.calls.seek(chat_id, source, target)
-            now = self._now()
-            session.position = target
-            session.updated_at = now
-            if session.status == "playing":
-                session.started_at = now - target
-            return {"ok": True, "action": "seek", "position": target, "state": session.to_dict()}
-
-    async def mute(self, chat_id: int, muted: bool):
-        await self.ensure_ready()
-        async with self.lock(chat_id):
-            session = self.sessions.get(chat_id)
-            if not session or session.status not in {"playing","paused"}:
-                return {"ok":False,"action":"mute","error":"no_active_audio","state":self.state(chat_id)}
-            if not self.calls:
-                raise RuntimeError("call_backend_not_ready")
-            await self.calls.set_muted(chat_id,bool(muted))
-            session.muted=bool(muted)
-            session.updated_at=self._now()
-            return {"ok":True,"action":"mute","state":session.to_dict()}
 
     async def enqueue(self, chat_id, source_type, source_id, **kw):
         return {"ok": True, "action": "enqueue", "state": self.state(chat_id)}
