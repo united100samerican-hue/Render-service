@@ -30,12 +30,6 @@ class CallManager:
         await self.calls.pause(int(chat_id))
     async def resume(self,chat_id:int)->None:
         await self.calls.resume(int(chat_id))
-    async def set_muted(self,chat_id:int,muted:bool)->None:
-        await self.calls.change_volume_call(int(chat_id),0 if muted else 100)
     async def stop(self,chat_id:int)->None:
         try:await self.calls.leave_call(int(chat_id))
         except(NoActiveGroupCall,NotInCallError):return
-    async def seek(self,chat_id:int,source:str,position:int)->None:
-        if not await self.active(chat_id):raise NoActiveGroupCall()
-        stream=MediaStream(str(source),ffmpeg_parameters=f'-ss {max(0,int(position))}')
-        await self.calls.play(int(chat_id),stream)
