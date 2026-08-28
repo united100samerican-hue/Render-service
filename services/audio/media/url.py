@@ -85,7 +85,7 @@ class UrlResolver:
         options={"quiet":True,"no_warnings":True,"skip_download":True,"noplaylist":True,"ignoreerrors":False,"socket_timeout":20,"retries":3,"fragment_retries":3,"concurrent_fragment_downloads":4,"continuedl":True,"geo_bypass":True,"http_headers":{"User-Agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/140.0 Safari/537.36"},"format":"bestaudio[ext=m4a]/bestaudio/best[acodec!=none]"}
         pot_url=os.getenv("POT_PROVIDER_URL","").strip().rstrip("/")
         if pot_url:
-            options["extractor_args"]={"youtube":{"player_client":["mweb"]},"youtubepot-bgutilhttp":{"base_url":pot_url}}
+            options["extractor_args"]={"youtube":{"player_client":["mweb"]},"youtubepot-bgutilhttp":{"base_url":[pot_url]}}
         elif with_embedded:
             options["extractor_args"]={"youtube":{"player_client":["web_embedded"]}}
         deno=shutil.which("deno") or ("/usr/local/bin/deno" if Path("/usr/local/bin/deno").is_file() else "")
