@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shutil
+import subprocess
 import tempfile
 import time
 from pathlib import Path
@@ -149,6 +151,15 @@ class AudioService:
         except Exception:
             pass
 
+    def _probe_duration(self, path: str) -> int:
+        if not path or not shutil.which("ffprobe"):
+            return 0
+        try:
+            r = subprocess.run(["ffprobe","-v","error","-show_entries","format=duration","-of","default=noprint_wrappers=1:nokey=1",str(path)],capture_output=True,text=True,timeout=20)
+            return max(0,int(float((r.stdout or "").strip() or 0))) if r.returncode == 0 else 0
+        except Exception:
+            return 0
+
     def state(self, chat_id: int) -> dict[str, Any]:
         session = self.sessions.get(int(chat_id))
         if not session:
@@ -277,12 +288,13 @@ class AudioService:
                 source_message_id,
                 title,
             )
+            resolved_duration = max(0, int(duration or 0)) or self._probe_duration(str(path))
             return {
                 "source_type": st,
                 "source_id": source_id,
                 "stream_url": str(path),
                 "title": title or path.stem,
-                "duration": duration,
+                "duration": resolved_duration,
                 "webpage_url": "",
                 "thumbnail": "",
                 "video": video,
@@ -309,12 +321,13 @@ class AudioService:
             if not self.telegram_media:
                 raise RuntimeError("telegram_media_not_ready")
             path, video, kind = await self.telegram_media.from_file_id(source_id, st, title)
+            resolved_duration = max(0, int(duration or 0)) or self._probe_duration(str(path))
             return {
                 "source_type": st,
                 "source_id": source_id,
                 "stream_url": str(path),
                 "title": title or path.stem,
-                "duration": duration,
+                "duration": resolved_duration,
                 "webpage_url": "",
                 "thumbnail": "",
                 "video": video,
