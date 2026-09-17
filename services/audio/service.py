@@ -1415,52 +1415,6 @@ class AudioService:
 
             if (
                 not session
-                or session.status != "playing"
-            ):
-                return {
-                    "ok": False,
-                    "action": "pause",
-                    "error": "no_active_audio",
-                    "state": self.state(
-                        chat_id,
-                    ),
-                }
-
-            await self.calls.pause(
-                chat_id,
-            )
-
-            now = self._now()
-
-            session.position = max(
-                0,
-                int(
-                    now - session.started_at
-                ),
-            )
-            session.status = "paused"
-            session.paused_at = int(now)
-            session.updated_at = now
-
-            return {
-                "ok": True,
-                "action": "pause",
-                "state": session.to_dict(),
-            }
-
-    async def resume(
-        self,
-        chat_id: int,
-    ):
-        await self.ensure_ready()
-
-        async with self.lock(chat_id):
-            session = self.sessions.get(
-                chat_id,
-            )
-
-            if (
-                not session
                 or session.status != "paused"
             ):
                 return {
