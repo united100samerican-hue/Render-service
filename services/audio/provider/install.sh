@@ -2,27 +2,26 @@
 set -eu
 
 VERSION="2.0.0"
-DEST="/opt/bgutil-ytdlp-pot-provider"
+DEST="${POT_PROVIDER_HOME:-/opt/bgutil-ytdlp-pot-provider}"
 TMP="/tmp/bgutil-ytdlp-pot-provider-${VERSION}.tar.gz"
+URL="https://github.com/Brainicism/bgutil-ytdlp-pot-provider/archive/refs/tags/${VERSION}.tar.gz"
 
-export DENO_NO_UPDATE_CHECK=1
-export DENO_NO_PROMPT=1
+command -v curl >/dev/null 2>&1 || { echo "curl is required" >&2; exit 1; }
+command -v deno >/dev/null 2>&1 || { echo "deno is required" >&2; exit 1; }
 
-rm -rf "$DEST"
+rm -rf "$DEST" "/opt/bgutil-ytdlp-pot-provider-${VERSION}" "$TMP"
 mkdir -p /opt
 
-curl --retry 4 --retry-delay 2 --retry-all-errors -fsSL \
-  "https://github.com/Brainicism/bgutil-ytdlp-pot-provider/archive/refs/tags/${VERSION}.tar.gz" \
-  -o "$TMP"
-
+echo "Installing bgutil-ytdlp-pot-provider ${VERSION}"
+curl --retry 4 --retry-delay 2 --retry-all-errors -fsSL "$URL" -o "$TMP"
 tar -xzf "$TMP" -C /opt
-
-mv \
-  "/opt/bgutil-ytdlp-pot-provider-${VERSION}" \
-  "$DEST"
-
+mv "/opt/bgutil-ytdlp-pot-provider-${VERSION}" "$DEST"
 rm -f "$TMP"
 
 cd "$DEST/server"
-
 deno install --allow-scripts=npm:canvas --frozen
+
+test -f "$DEST/server/src/main.ts"
+test -d "$DEST/server/node_modules"
+
+echo "bgutil-ytdlp-pot-provider ${VERSION} installed at $DEST"
