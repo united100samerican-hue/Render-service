@@ -13,7 +13,7 @@ from urllib.parse import urlsplit
 import httpx
 import yt_dlp
 
-from config import POT_PROVIDER_URL, YOUTUBE_COOKIES
+from config import BGUTIL_SERVER_HOME, YOUTUBE_COOKIES
 
 
 VIDEO_EXTS = {
@@ -232,23 +232,24 @@ class UrlResolver:
                 )
             },
             "format": (
-                "best[ext=mp4][vcodec!=none][acodec!=none]"
-                "/best[vcodec!=none][acodec!=none]"
-                "/best[acodec!=none]"
-                "/best"
-            ),
+                    "best[height<=720][ext=mp4][vcodec!=none][acodec!=none]"
+                        "/best[height<=720][vcodec!=none][acodec!=none]"
+                            "/best[acodec!=none]"
+                                "/best"
+                                ),
+            
         }
 
-        if POT_PROVIDER_URL:
-            options["extractor_args"] = {
-                "youtube": {
-                    "player_client": ["mweb"],
-                },
-                "youtubepot-bgutilhttp": {
-                    "base_url": [POT_PROVIDER_URL],
-                },
-            }
-        elif embedded:
+        if BGUTIL_SERVER_HOME:
+                options["extractor_args"] = {
+                        "youtube": {
+                                    "player_client": ["mweb"],
+                                            },
+                                                    "youtubepot-bgutilscript": {
+                                                                "server_home": [BGUTIL_SERVER_HOME],
+                                                                        },
+                                                                            }
+                                                                            elif embedded:
             options["extractor_args"] = {
                 "youtube": {
                     "player_client": ["web_embedded"],
@@ -341,7 +342,7 @@ class UrlResolver:
             if (
                 not is_youtube
                 or not self._is_bot_check_error(exc)
-                or POT_PROVIDER_URL
+                or BGUTIL_SERVER_HOME
             ):
                 raise
 

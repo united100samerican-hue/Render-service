@@ -5,5 +5,9 @@ RUN curl -fsSL https://deno.land/install.sh | sh
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install -r requirements.txt
+COPY provider /tmp/audio-pot-provider
+RUN chmod +x /tmp/audio-pot-provider/install.sh \
+ && /tmp/audio-pot-provider/install.sh \
+ && rm -rf /tmp/audio-pot-provider
 COPY . .
 CMD ["uvicorn","app:app","--host","0.0.0.0","--port","10000","--workers","1"]
