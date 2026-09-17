@@ -4,6 +4,7 @@ import asyncio
 import base64
 import os
 import shutil
+import socket
 import tempfile
 import time
 from pathlib import Path
@@ -13,7 +14,7 @@ from urllib.parse import urlsplit
 import httpx
 import yt_dlp
 
-from config import BGUTIL_SERVER_HOME, YOUTUBE_COOKIES
+from config import POT_PROVIDER_URL, YOUTUBE_COOKIES
 
 
 VIDEO_EXTS = {
@@ -63,6 +64,8 @@ class UrlResolver:
         self._cache_ttl = 90
         self._cache: dict[str, tuple[float, dict[str, Any]]] = {}
         self._cookie_file = ""
+        self._pot_available = None
+        self._pot_checked_at = 0.0
         self._prepare_cookies()
 
     def _cache_get(self, source: str) -> dict[str, Any] | None:
@@ -209,7 +212,27 @@ class UrlResolver:
             or "confirm you’re not a bot" in message
         )
 
-    def _youtube_options(self, embedded: bool = False) -> dict[str, Any]:
+    def _provider_available(self) -> bool:
+        now = time.time()
+        if now - self._pot_checked_at < 10.0 and self._pot_available is not None:
+            return bool(self._pot_available)
+
+        try:
+            host = urlsplit(POT_PROVIDER_URL).hostname or "127.0.0.1"
+            port = int(urlsplit(POT_PROVIDER_URL).port or 4416)
+            with socket.create_connection((host, port), timeout=0.25):
+                self._pot_available = True
+        except Exception:
+            self._pot_available = False
+
+        self._pot_checked_at = now
+        return bool(self._pot_available)
+
+    def _youtube_options(
+        self,
+        embedded: bool = False,
+        use_provider: bool | None = None,
+    ) -> dict[str, Any]:
         options: dict[str, Any] = {
             "quiet": True,
             "no_warnings": True,
@@ -232,24 +255,26 @@ class UrlResolver:
                 )
             },
             "format": (
-                    "best[height<=720][ext=mp4][vcodec!=none][acodec!=none]"
-                        "/best[height<=720][vcodec!=none][acodec!=none]"
-                            "/best[acodec!=none]"
-                                "/best"
-                                ),
-            
+                "best[ext=mp4][vcodec!=none][acodec!=none]"
+                "/best[vcodec!=none][acodec!=none]"
+                "/best[acodec!=none]"
+                "/best"
+            ),
         }
 
-        if BGUTIL_SERVER_HOME:
-                options["extractor_args"] = {
-                        "youtube": {
-                                    "player_client": ["mweb"],
-                                            },
-                                                    "youtubepot-bgutilscript": {
-                                                                "server_home": [BGUTIL_SERVER_HOME],
-                                                                        },
-                                                                            }
-                                                                            elif embedded:
+        if use_provider is None:
+            use_provider = self._provider_available()
+
+        if use_provider and not embedded:
+            options["extractor_args"] = {
+                "youtube": {
+                    "player_client": ["mweb"],
+                },
+                "youtubepot-bgutilhttp": {
+                    "base_url": [POT_PROVIDER_URL],
+                },
+            }
+        elif embedded:
             options["extractor_args"] = {
                 "youtube": {
                     "player_client": ["web_embedded"],
@@ -341,12 +366,15 @@ class UrlResolver:
         except yt_dlp.utils.DownloadError as exc:
             if (
                 not is_youtube
+                or self._is_youtube_search(source)
                 or not self._is_bot_check_error(exc)
-                or BGUTIL_SERVER_HOME
             ):
                 raise
 
-            info = run(self._youtube_options(True))
+            try:
+                info = run(self._youtube_options(True, use_provider=False))
+            except yt_dlp.utils.DownloadError:
+                raise exc
 
         stream = str(info.get("url") or "")
 
