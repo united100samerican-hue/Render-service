@@ -162,9 +162,7 @@ class UrlResolver:
             .strip()
         )
 
-        ext = Path(
-            urlsplit(raw).path
-        ).suffix.lower()
+        ext = Path(urlsplit(raw).path).suffix.lower()
 
         if raw.startswith(("rtmp://", "rtmps://", "rtsp://")):
             return True, "video", True
@@ -210,18 +208,26 @@ class UrlResolver:
             or "not a bot" in message
             or "bot check" in message
             or "confirm you’re not a bot" in message
+            or "confirm you're not a bot" in message
+            or "login_required" in message
         )
 
     def _provider_available(self) -> bool:
         now = time.time()
+
         if now - self._pot_checked_at < 10.0 and self._pot_available is not None:
             return bool(self._pot_available)
 
         try:
-            host = urlsplit(POT_PROVIDER_URL).hostname or "127.0.0.1"
-            port = int(urlsplit(POT_PROVIDER_URL).port or 4416)
-            with socket.create_connection((host, port), timeout=0.25):
-                self._pot_available = True
+            base = str(POT_PROVIDER_URL or "").rstrip("/")
+            if not base:
+                self._pot_available = False
+            else:
+                response = httpx.get(
+                    f"{base}/ping",
+                    timeout=0.8,
+                )
+                self._pot_available = response.is_success
         except Exception:
             self._pot_available = False
 
@@ -232,6 +238,8 @@ class UrlResolver:
         self,
         embedded: bool = False,
         use_provider: bool | None = None,
+        player_client: str | None = None,
+        flat_search: bool = False,
     ) -> dict[str, Any]:
         options: dict[str, Any] = {
             "quiet": True,
@@ -242,7 +250,7 @@ class UrlResolver:
             "socket_timeout": 20,
             "retries": 3,
             "fragment_retries": 3,
-            "concurrent_fragment_downloads": 4,
+            "concurrent_fragment_downloads": 2,
             "continuedl": True,
             "geo_bypass": True,
             "http_headers": {
@@ -254,18 +262,33 @@ class UrlResolver:
                     "Chrome/140.0 Safari/537.36"
                 )
             },
-            "format": (
-                "best[ext=mp4][vcodec!=none][acodec!=none]"
-                "/best[vcodec!=none][acodec!=none]"
+        }
+
+        if flat_search:
+            options["extract_flat"] = "in_playlist"
+            options["playlistend"] = 1
+        else:
+            options["format"] = (
+                "best[height<=720][ext=mp4][vcodec!=none][acodec!=none]"
+                "/best[height<=720][vcodec!=none][acodec!=none]"
                 "/best[acodec!=none]"
                 "/best"
-            ),
-        }
+            )
 
         if use_provider is None:
             use_provider = self._provider_available()
 
-        if use_provider and not embedded:
+        if player_client:
+            options["extractor_args"] = {
+                "youtube": {
+                    "player_client": [player_client],
+                }
+            }
+            if player_client == "mweb" and use_provider:
+                options["extractor_args"]["youtubepot-bgutilhttp"] = {
+                    "base_url": [POT_PROVIDER_URL],
+                }
+        elif use_provider and not embedded and not flat_search:
             options["extractor_args"] = {
                 "youtube": {
                     "player_client": ["mweb"],
@@ -312,7 +335,7 @@ class UrlResolver:
             "socket_timeout": 20,
             "retries": 3,
             "fragment_retries": 3,
-            "concurrent_fragment_downloads": 4,
+            "concurrent_fragment_downloads": 2,
             "continuedl": True,
             "geo_bypass": True,
             "http_headers": {
@@ -326,57 +349,163 @@ class UrlResolver:
             ),
         }
 
+    @staticmethod
+    def _first_entry(info: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not info:
+            return None
+
+        entries = info.get("entries")
+        if not entries:
+            return info
+
+        return next(
+            (
+                entry
+                for entry in entries
+                if entry
+            ),
+            None,
+        )
+
+    def _run(self, source: str, options: dict[str, Any]) -> dict[str, Any]:
+        with yt_dlp.YoutubeDL(options) as ydl:
+            info = ydl.extract_info(
+                source,
+                download=False,
+            )
+
+        info = self._first_entry(info)
+
+        if not info:
+            raise RuntimeError("url_metadata_empty")
+
+        return info
+
+    def _search_result_url(self, source: str) -> str:
+        options = self._youtube_options(
+            use_provider=False,
+            flat_search=True,
+        )
+
+        info = self._run(source, options)
+
+        webpage = str(
+            info.get("webpage_url")
+            or info.get("original_url")
+            or ""
+        ).strip()
+
+        if webpage:
+            return webpage
+
+        video_id = str(info.get("id") or "").strip()
+
+        if video_id:
+            return f"https://www.youtube.com/watch?v={video_id}"
+
+        raise RuntimeError("search_result_url_missing")
+
+    def _extract_direct(self, source: str) -> dict[str, Any]:
+        provider = self._provider_available()
+        errors: list[Exception] = []
+
+        variants: list[dict[str, Any]] = []
+
+        # When cookies are present, the authenticated request is tried first.
+        # On Render/datacenter IPs this is materially more reliable for
+        # YouTube's "Sign in to confirm you're not a bot" challenge.
+        if self._cookie_file:
+            variants.append(
+                self._youtube_options(
+                    use_provider=provider,
+                )
+            )
+
+        # Keep the no-forced-client/default extractor available. It can work
+        # on videos that do not require the mweb client.
+        variants.append(
+            self._youtube_options(
+                use_provider=False,
+            )
+        )
+
+        # mweb + bgutil remains the recommended PO-token path when available.
+        if provider:
+            variants.append(
+                self._youtube_options(
+                    use_provider=True,
+                    player_client="mweb",
+                )
+            )
+
+        # Embedded/tv clients do not require the bgutil POT path. They are
+        # fallback clients for public videos that are embeddable/available
+        # through those clients.
+        variants.append(
+            self._youtube_options(
+                use_provider=False,
+                player_client="web_embedded",
+            )
+        )
+        variants.append(
+            self._youtube_options(
+                use_provider=False,
+                player_client="tv",
+            )
+        )
+
+        seen: set[str] = set()
+
+        for options in variants:
+            key = repr(
+                options.get("extractor_args", {})
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+
+            try:
+                return self._run(source, options)
+            except yt_dlp.utils.DownloadError as exc:
+                errors.append(exc)
+                continue
+
+        last = errors[-1] if errors else RuntimeError("youtube_extract_failed")
+
+        if not self._cookie_file and any(
+            self._is_bot_check_error(exc)
+            for exc in errors
+        ):
+            raise RuntimeError(
+                "youtube_login_required: YouTube is challenging the Render "
+                "egress IP. Set YOUTUBE_COOKIES to a fresh Netscape cookie "
+                "file from a dedicated YouTube browser session."
+            ) from last
+
+        raise last
+
     def _extract(self, source: str) -> dict[str, Any]:
         is_youtube = (
             self._is_youtube_search(source)
             or self._is_youtube_url(source)
         )
 
-        options = (
-            self._youtube_options()
-            if is_youtube
-            else self._generic_options()
-        )
+        if is_youtube and self._is_youtube_search(source):
+            source = self._search_result_url(source)
 
-        def run(opts: dict[str, Any]) -> dict[str, Any]:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(
-                    source,
-                    download=False,
-                )
-
-                if info and info.get("entries"):
-                    info = next(
-                        (
-                            entry
-                            for entry in info["entries"]
-                            if entry
-                        ),
-                        None,
-                    )
-
-                if not info:
-                    raise RuntimeError("url_metadata_empty")
-
-                return info
-
-        try:
-            info = run(options)
-
-        except yt_dlp.utils.DownloadError as exc:
-            if (
-                not is_youtube
-                or self._is_youtube_search(source)
-                or not self._is_bot_check_error(exc)
-            ):
-                raise
-
-            try:
-                info = run(self._youtube_options(True, use_provider=False))
-            except yt_dlp.utils.DownloadError:
-                raise exc
+        if is_youtube:
+            info = self._extract_direct(source)
+        else:
+            info = self._run(
+                source,
+                self._generic_options(),
+            )
 
         stream = str(info.get("url") or "")
+        selected_headers = dict(
+            info.get("http_headers")
+            or {}
+        )
 
         if not stream:
             formats = [
@@ -387,30 +516,43 @@ class UrlResolver:
             ]
 
             if is_youtube:
-                formats = [
+                progressive = [
                     item
                     for item in formats
                     if item.get("vcodec") not in (None, "none")
                     and item.get("acodec") not in (None, "none")
-                ] or [
+                    and (
+                        not item.get("height")
+                        or int(item.get("height") or 0) <= 720
+                    )
+                ]
+
+                audio_only = [
                     item
                     for item in formats
                     if item.get("acodec") not in (None, "none")
-                ] or formats
+                ]
+
+                formats = progressive or audio_only or formats
 
             if not formats:
                 raise RuntimeError("url_stream_not_found")
 
             formats.sort(
                 key=lambda item: (
-                    item.get("height") or 0,
+                    min(int(item.get("height") or 0), 720),
                     item.get("tbr") or 0,
                     item.get("abr") or 0,
                 ),
                 reverse=True,
             )
 
-            stream = str(formats[0]["url"])
+            selected = formats[0]
+            stream = str(selected["url"])
+            selected_headers = dict(
+                selected.get("http_headers")
+                or {}
+            )
 
         webpage = str(
             info.get("webpage_url")
@@ -450,6 +592,7 @@ class UrlResolver:
             "media_kind": "video" if video else "audio",
             "live": bool(info.get("is_live")),
             "video_id": str(info.get("id") or ""),
+            "http_headers": selected_headers,
         }
 
     async def resolve(self, url: str) -> dict[str, Any]:
@@ -458,21 +601,32 @@ class UrlResolver:
         if not source:
             raise RuntimeError("url_missing")
 
+        cache_key = source
+
+        cached = self._cache_get(cache_key)
+        if cached:
+            return cached
+
         if (
             self._is_youtube_search(source)
             or self._is_youtube_url(source)
         ):
-            cached = self._cache_get(source)
-
-            if cached:
-                return cached
-
             result = await asyncio.to_thread(
                 self._extract,
                 source,
             )
 
-            self._cache_set(source, result)
+            self._cache_set(cache_key, result)
+
+            # Search results should also be cached under the resolved page URL
+            # to reduce repeated YouTube player requests for the same selection.
+            resolved_url = str(
+                result.get("webpage_url")
+                or ""
+            ).strip()
+            if resolved_url and resolved_url != cache_key:
+                self._cache_set(resolved_url, result)
+
             return result
 
         direct, kind, live = self._is_direct(source)
@@ -499,29 +653,107 @@ class UrlResolver:
             result = {
                 "source_url": source,
                 "stream_url": final or source,
-                "title": Path(name).stem.strip()
-                if name
-                else "Audio",
+                "title": (
+                    Path(name).stem.strip()
+                    if name
+                    else "Audio"
+                ),
                 "duration": 0,
                 "webpage_url": source,
                 "thumbnail": "",
                 "video": kind == "video",
                 "media_kind": kind,
                 "live": live,
+                "http_headers": {
+                    "User-Agent": "Mozilla/5.0",
+                },
             }
 
             self._cache_set(source, result)
             return result
 
-        cached = self._cache_get(source)
-
-        if cached:
-            return cached
-
         result = await asyncio.to_thread(
-            self._extract,
+            self._run,
             source,
+            self._generic_options(),
         )
 
-        self._cache_set(source, result)
-        return result
+        stream = str(result.get("url") or "")
+        headers = dict(
+            result.get("http_headers")
+            or {}
+        )
+
+        if not stream:
+            formats = [
+                item
+                for item in (result.get("formats") or [])
+                if item.get("url")
+                and item.get("protocol") not in {"mhtml"}
+            ]
+
+            if not formats:
+                raise RuntimeError("url_stream_not_found")
+
+            formats.sort(
+                key=lambda item: (
+                    item.get("height") or 0,
+                    item.get("tbr") or 0,
+                    item.get("abr") or 0,
+                ),
+                reverse=True,
+            )
+            selected = formats[0]
+            stream = str(selected["url"])
+            headers = dict(
+                selected.get("http_headers")
+                or {}
+            )
+
+        webpage = str(
+            result.get("webpage_url")
+            or result.get("original_url")
+            or source
+        ).strip()
+
+        video_codec = str(result.get("vcodec") or "")
+        audio_codec = str(result.get("acodec") or "")
+        video = bool(
+            video_codec
+            and video_codec != "none"
+            and audio_codec
+            and audio_codec != "none"
+        )
+
+        output = {
+            "source_url": webpage,
+            "stream_url": stream,
+            "title": str(
+                result.get("title")
+                or "غير معروف"
+            ),
+            "duration": int(
+                result.get("duration")
+                or 0
+            ),
+            "webpage_url": webpage,
+            "thumbnail": str(
+                result.get("thumbnail")
+                or ""
+            ),
+            "video": video,
+            "media_kind": (
+                "video"
+                if video
+                else "audio"
+            ),
+            "live": bool(result.get("is_live")),
+            "video_id": str(
+                result.get("id")
+                or ""
+            ),
+            "http_headers": headers,
+        }
+
+        self._cache_set(source, output)
+        return output
