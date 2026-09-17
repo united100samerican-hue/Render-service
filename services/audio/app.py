@@ -66,7 +66,11 @@ async def root():return {'ok':True,'service':'render-audio','ready':service.read
 @app.get('/ping',response_class=PlainTextResponse)
 async def ping():return 'OK'
 @app.get('/health')
-async def health():return {'ok':True,'ready':service.ready,'backend_error':service.backend_error,'active_sessions':len(service.sessions)}
+async def health():return {'ok':True,'ready':service.ready,'backend_error':service.backend_error,'active_sessions':len(service.sessions),'youtube':service.youtube_status()}
+@app.get('/youtube/status')
+async def youtube_status(x_keepalive_secret:str|None=Header(default=None,alias='x-keepalive-secret')):
+    guard(x_keepalive_secret)
+    return {'ok':True,'youtube':service.youtube_status()}
 @app.get('/state/{chat_id}')
 async def state(chat_id:int,x_keepalive_secret:str|None=Header(default=None,alias='x-keepalive-secret')):
     guard(x_keepalive_secret);return service.state(chat_id)
