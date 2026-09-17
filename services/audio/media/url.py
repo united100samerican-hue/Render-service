@@ -128,13 +128,9 @@ class UrlResolver:
         if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
             value = value[1:-1].strip()
 
-        candidate_path = Path(value).expanduser()
-        if candidate_path.is_file():
-            try:
-                return candidate_path.read_text(encoding="utf-8"), "file"
-            except Exception:
-                pass
-
+        # Render environment variables may contain escaped newlines/tabs.
+        # Decode those before any filesystem probing so a whole cookie file is
+        # never accidentally treated as one enormous filename.
         if "\\n" in value or "\\r" in value or "\\t" in value:
             value = value.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "\r").replace("\\t", "\t")
 
@@ -161,6 +157,19 @@ class UrlResolver:
                 if "HTTP Cookie File" in decoded[:256] or "Netscape HTTP Cookie File" in decoded[:256]:
                     return decoded, "base64_auto"
             except Exception:
+                pass
+
+        # A real file path is the final possibility. Guard both length and
+        # OSError because Linux rejects overlong path components with errno 36.
+        if "\n" not in value and "\r" not in value and "\x00" not in value and len(value) <= 4096:
+            try:
+                candidate_path = Path(value).expanduser()
+                if candidate_path.is_file():
+                    try:
+                        return candidate_path.read_text(encoding="utf-8"), "file"
+                    except (OSError, UnicodeError):
+                        pass
+            except (OSError, ValueError):
                 pass
 
         return value, "text_invalid"
