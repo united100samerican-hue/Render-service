@@ -41,6 +41,10 @@ def intval(b,*names):
     try:return int(pick(b,*names,default=0) or 0)
     except:return 0
 def title(b):return str(pick(b,'title',default='')).strip()
+def boolean(b,*names,default=False):
+    value=pick(b,*names,default=default)
+    if isinstance(value,bool):return value
+    return str(value).strip().lower() in {'1','true','yes','on'}
 def err_response(action,e,c):
     code=str(getattr(e,'code','') or '')
     if not code:
@@ -64,7 +68,8 @@ async def ping():return 'OK'
 @app.get('/health')
 async def health():return {'ok':True,'ready':service.ready,'backend_error':service.backend_error,'active_sessions':len(service.sessions)}
 @app.get('/state/{chat_id}')
-async def state(chat_id:int):return service.state(chat_id)
+async def state(chat_id:int,x_keepalive_secret:str|None=Header(default=None,alias='x-keepalive-secret')):
+    guard(x_keepalive_secret);return service.state(chat_id)
 @app.post('/call/state')
 async def call_state(req:Request,x_keepalive_secret:str|None=Header(default=None,alias='x-keepalive-secret')):
     guard(x_keepalive_secret);b=await body(req);c=cid(b)
@@ -99,7 +104,7 @@ for action in ('pause','resume','stop'):
     app.post(f'/{action}')(endpoint)
 @app.post('/enqueue')
 async def enqueue(req:Request,x_keepalive_secret:str|None=Header(default=None,alias='x-keepalive-secret')):
-    guard(x_keepalive_secret);b=await body(req);c=cid(b);return await service.enqueue(c,stype(b),sid(b),title=title(b),duration=intval(b,'duration'),requested_by=str(pick(b,'requestedBy','requested_by',default='')),auto_start=bool(pick(b,'autoStart','auto_start',default=False)),source_chat_id=scid(b),source_message_id=smid(b))
+    guard(x_keepalive_secret);b=await body(req);c=cid(b);return await service.enqueue(c,stype(b),sid(b),title=title(b),duration=intval(b,'duration'),requested_by=str(pick(b,'requestedBy','requested_by',default='')),auto_start=boolean(b,'autoStart','auto_start',default=False),source_chat_id=scid(b),source_message_id=smid(b))
 @app.post('/queue')
 async def queue(req:Request,x_keepalive_secret:str|None=Header(default=None,alias='x-keepalive-secret')):
     guard(x_keepalive_secret);return await service.queue_list(cid(await body(req)))

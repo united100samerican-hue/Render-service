@@ -21,8 +21,10 @@ SESSION_STRING = AUDIO_SESSION_STRING or _s("SESSION_STRING")
 BOT_TOKEN = _s("BOT_TOKEN")
 KEEPALIVE_SECRET = _s("KEEPALIVE_SECRET")
 
+# Local-only BgUtils provider. No Render/Web environment variable is required.
+POT_PROVIDER_URL = "http://127.0.0.1:4416"
+
 YOUTUBE_COOKIES = _s("YOUTUBE_COOKIES")
-BGUTIL_SERVER_HOME = _s("BGUTIL_SERVER_HOME", "/opt/bgutil-ytdlp-pot-provider/server")
 
 R2_ENDPOINT = _s("R2_ENDPOINT")
 R2_BUCKET = _s("R2_BUCKET", "audio-cache")
