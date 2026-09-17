@@ -34,7 +34,7 @@ if [ -f "$POT_HOME/server/src/main.ts" ] && command -v deno >/dev/null 2>&1; the
     READY=0
     i=0
     while [ "$i" -lt 40 ]; do
-        if curl -fsS --max-time 1 -o /dev/null "http://${POT_HOST}:${POT_PORT}/" 2>/dev/null; then
+        if curl -fsS --max-time 1 -o /dev/null "http://${POT_HOST}:${POT_PORT}/ping" 2>/dev/null; then
             READY=1
             break
         fi

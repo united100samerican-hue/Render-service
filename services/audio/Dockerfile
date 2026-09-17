@@ -12,9 +12,12 @@ RUN apt-get update \
         ca-certificates \
         curl \
         tar \
+        unzip \
     && rm -rf /var/lib/apt/lists/*
 
-RUN curl -fsSL https://deno.land/install.sh | sh
+# Pin Deno to a known-good 2.x release instead of the moving latest tag.
+RUN curl -fsSL https://deno.land/install.sh | sh -s v2.9.5 \
+    && /usr/local/bin/deno --version
 
 WORKDIR /app
 
