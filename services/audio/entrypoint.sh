@@ -15,26 +15,24 @@ cleanup() {
 
 trap cleanup INT TERM EXIT
 
-if [ -f "$POT_HOME/server/src/main.ts" ] && command -v deno >/dev/null 2>&1; then
-    (
-        cd "$POT_HOME/server/node_modules"
-        exec deno run \
-            --no-prompt \
-            --allow-env \
-            --allow-net \
-            --allow-ffi=. \
-            --allow-read=. \
-            --allow-sys \
-            ../src/main.ts \
-            --host "$POT_HOST" \
-            --port "$POT_PORT"
-    ) > /tmp/bgutil-pot-provider.log 2>&1 &
+if [ -f "$POT_HOME/src/main.ts" ] && [ -x /usr/local/bin/deno ]; then
+    /usr/local/bin/deno run \
+        --no-prompt \
+        --allow-env \
+        --allow-net \
+        --allow-ffi="$POT_HOME/node_modules" \
+        --allow-read="$POT_HOME/node_modules" \
+        "$POT_HOME/src/main.ts" \
+        --host "$POT_HOST" \
+        --port "$POT_PORT" \
+        > /tmp/bgutil-pot-provider.log 2>&1 &
     POT_PID=$!
 
     READY=0
     i=0
-    while [ "$i" -lt 40 ]; do
-        if curl -fsS --max-time 1 -o /dev/null "http://${POT_HOST}:${POT_PORT}/ping" 2>/dev/null; then
+    while [ "$i" -lt 120 ]; do
+        if curl -fsS --max-time 1 -o /dev/null \
+            "http://${POT_HOST}:${POT_PORT}/ping" 2>/dev/null; then
             READY=1
             break
         fi
@@ -53,7 +51,7 @@ if [ -f "$POT_HOME/server/src/main.ts" ] && command -v deno >/dev/null 2>&1; the
     if [ "$READY" -eq 1 ]; then
         echo "BgUtils POT provider ready on ${POT_HOST}:${POT_PORT}"
     elif [ -n "$POT_PID" ]; then
-        echo "WARNING: BgUtils POT provider did not become ready; continuing with audio service." >&2
+        echo "WARNING: BgUtils provider did not become ready within 30 seconds; continuing with audio service." >&2
         cat /tmp/bgutil-pot-provider.log >&2 || true
     fi
 else
