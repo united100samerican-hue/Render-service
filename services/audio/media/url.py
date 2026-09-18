@@ -190,6 +190,8 @@ class UrlResolver:
         rows = 0
         auth = 0
         expired_auth = 0
+        login_info = 0
+        sapisid = 0
 
         for line in lines:
             if not line.strip() or line.startswith("#") and not line.startswith("#HttpOnly_"):
@@ -207,6 +209,10 @@ class UrlResolver:
                 domains.add(domain)
                 if name in auth_names:
                     auth += 1
+                    if name == "LOGIN_INFO":
+                        login_info += 1
+                    if name in {"SAPISID", "__SECURE-3PAPISID", "__SECURE-1PAPISID"}:
+                        sapisid += 1
                     try:
                         expires = int(parts[4].strip() or 0)
                     except Exception:
@@ -220,6 +226,8 @@ class UrlResolver:
             "youtube_domains": len(domains),
             "auth_cookies": auth,
             "expired_auth_cookies": expired_auth,
+            "login_info": login_info > 0,
+            "sapisid_cookies": sapisid,
         }
 
     def _prepare_cookies(self):
@@ -376,6 +384,7 @@ class UrlResolver:
         self,
         player_clients: list[str] | None = None,
         use_provider: bool = False,
+        use_cookies: bool = True,
     ) -> dict[str, Any]:
         options: dict[str, Any] = {
             "quiet": True,
@@ -430,7 +439,7 @@ class UrlResolver:
                 }
             }
 
-        if self._cookie_file:
+        if use_cookies and self._cookie_file:
             options["cookiefile"] = self._cookie_file
 
         return options
@@ -469,63 +478,70 @@ class UrlResolver:
         attempts: list[tuple[str, dict[str, Any]]] = []
         provider = self._provider_available() if is_youtube else False
 
-        if is_youtube and self._cookie_file:
-            # Logged-in YouTube currently has problems with tv_downgraded in the
-            # default client. Keep the upstream-recommended default+embedded
-            # chain first, then use explicit fallbacks that do not depend on the
-            # same player-response path.
-            attempts.append((
-                "default+web_embedded",
-                self._youtube_options(
-                    player_clients=["default", "web_embedded"],
-                    use_provider=provider,
-                ),
-            ))
-            attempts.append((
-                "web_embedded",
-                self._youtube_options(
-                    player_clients=["web_embedded"],
-                    use_provider=False,
-                ),
-            ))
-            if provider:
+        if is_youtube:
+            if self._cookie_file:
+                # Let yt-dlp choose its current authenticated default clients.
+                # In current yt-dlp these are web_embedded, tv_downgraded and web.
+                # Explicitly using the literal "default" is NOT equivalent when
+                # cookies are present; it can select the guest defaults instead.
                 attempts.append((
-                    "mweb+bgutil",
+                    "authenticated-default",
                     self._youtube_options(
-                        player_clients=["mweb"],
-                        use_provider=True,
+                        use_provider=provider,
                     ),
                 ))
-            attempts.append((
-                "tv",
-                self._youtube_options(
-                    player_clients=["tv"],
-                    use_provider=False,
-                ),
-            ))
-        elif is_youtube:
-            attempts.append((
-                "web_embedded",
-                self._youtube_options(
-                    player_clients=["web_embedded"],
-                    use_provider=False,
-                ),
-            ))
-            if provider:
+                if provider:
+                    attempts.append((
+                        "mweb+bgutil",
+                        self._youtube_options(
+                            player_clients=["mweb"],
+                            use_provider=True,
+                        ),
+                    ))
                 attempts.append((
-                    "mweb+bgutil",
+                    "web_creator",
                     self._youtube_options(
-                        player_clients=["mweb"],
-                        use_provider=True,
+                        player_clients=["web_creator"],
+                        use_provider=provider,
                     ),
                 ))
-            attempts.append((
-                "tv",
-                self._youtube_options(
-                    player_clients=["tv"],
-                    use_provider=False,
-                ),
-            ))
+                # Final guest-only probe. This is useful for public videos and
+                # avoids sending account cookies to a client that does not support
+                # authenticated sessions.
+                attempts.append((
+                    "android_vr-guest",
+                    self._youtube_options(
+                        player_clients=["android_vr"],
+                        use_provider=False,
+                        use_cookies=False,
+                    ),
+                ))
+            else:
+                # Guest default is selected by yt-dlp itself.
+                attempts.append((
+                    "guest-default",
+                    self._youtube_options(
+                        use_provider=provider,
+                        use_cookies=False,
+                    ),
+                ))
+                if provider:
+                    attempts.append((
+                        "mweb+bgutil",
+                        self._youtube_options(
+                            player_clients=["mweb"],
+                            use_provider=True,
+                            use_cookies=False,
+                        ),
+                    ))
+                attempts.append((
+                    "android_vr-guest",
+                    self._youtube_options(
+                        player_clients=["android_vr"],
+                        use_provider=False,
+                        use_cookies=False,
+                    ),
+                ))
         else:
             attempts = [("generic", self._generic_options())]
 
@@ -581,7 +597,9 @@ class UrlResolver:
         else:
             if last_exc is not None:
                 if is_youtube and self._cookie_file and self._is_bot_check_error(last_exc):
-                    raise RuntimeError("youtube_cookies_rejected_or_expired") from last_exc
+                    if not self._cookie_status.get("login_info"):
+                        raise RuntimeError("youtube_cookies_missing_login_info") from last_exc
+                    raise RuntimeError("youtube_egress_or_session_rejected") from last_exc
                 raise last_exc
 
         stream = str(info.get("url") or "")
