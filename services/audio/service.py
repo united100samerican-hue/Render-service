@@ -539,6 +539,13 @@ class AudioService:
             if metadata_only:
                 return result
 
+            # Preserve the old working YouTube behavior: play the extracted
+            # remote stream URL directly through PyTgCalls/FFmpeg. This is
+            # especially important for web_safari HLS URLs; downloading the
+            # .m3u8 text with httpx would not produce a playable media file.
+            if result.get("remote_stream"):
+                return result
+
             return await self._materialize_url(
                 result,
             )
