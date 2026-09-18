@@ -392,41 +392,52 @@ class UrlResolver:
             "skip_download": True,
             "noplaylist": True,
             "ignoreerrors": False,
-            "socket_timeout": 20,
-            "retries": 3,
-            "extractor_retries": 2,
-            "fragment_retries": 3,
-            "file_access_retries": 2,
-            "concurrent_fragment_downloads": 4,
+            "socket_timeout": 25,
+            "retries": 5,
+            "extractor_retries": 3,
+            "fragment_retries": 5,
+            "file_access_retries": 3,
+            "concurrent_fragment_downloads": 3,
             "continuedl": True,
             "geo_bypass": True,
-            # The Audio service downloads the selected URL itself; it does not
-            # execute an HLS/DASH manifest. Prefer direct HTTP(S) progressive
-            # formats so web_embedded SABR/m3u8 formats are not selected as a
-            # local .mp4 file by mistake.
+            # Keep the old working format strategy: prefer HLS when a supported
+            # YouTube client exposes it, then fall back to progressive HTTP.
+            # HLS is intentionally allowed here because PyTgCalls/FFmpeg can
+            # play the returned remote manifest directly.
             "format": (
-                "best[protocol^=http][ext=mp4][vcodec!=none][acodec!=none]"
+                "best[protocol^=m3u8][vcodec!=none][acodec!=none]"
+                "/best[protocol^=m3u8][acodec!=none]"
                 "/best[protocol^=http][vcodec!=none][acodec!=none]"
                 "/best[protocol^=http][acodec!=none]"
-                "/best[protocol^=http]"
+                "/best[acodec!=none]"
                 "/best"
             ),
         }
 
-        extractor_args: dict[str, Any] = {}
+        youtube_args: dict[str, Any] = {}
         if player_clients:
-            extractor_args["youtube"] = {
-                "player_client": list(player_clients),
-            }
+            # This is deliberately a single yt-dlp extraction using the same
+            # client combination that the old working service used. It lets
+            # yt-dlp merge whichever client returns usable data instead of
+            # forcing each client into isolated attempts.
+            youtube_args["player_client"] = list(player_clients)
+            # Keep formats requiring a PO token visible to yt-dlp. The old
+            # working service explicitly used this with bgutil.
+            youtube_args["formats"] = ["missing_pot"]
+
+        extractor_args: dict[str, Any] = {}
+        if youtube_args:
+            extractor_args["youtube"] = youtube_args
+
         if use_provider and self._provider_available():
             extractor_args["youtubepot-bgutilhttp"] = {
                 "base_url": [POT_PROVIDER_URL],
             }
+
         if extractor_args:
             options["extractor_args"] = extractor_args
 
         deno = shutil.which("deno")
-
         if not deno:
             candidate = "/usr/local/bin/deno"
             if Path(candidate).is_file():
@@ -479,48 +490,47 @@ class UrlResolver:
         provider = self._provider_available() if is_youtube else False
 
         if is_youtube:
+            # Reproduce the extraction strategy from the old service that was
+            # known to work: use one combined client request with mweb,
+            # web_safari and android, while keeping missing-POT formats enabled.
             if self._cookie_file:
-                # Let yt-dlp choose its current authenticated default clients.
-                # In current yt-dlp these are web_embedded, tv_downgraded and web.
-                # Explicitly using the literal "default" is NOT equivalent when
-                # cookies are present; it can select the guest defaults instead.
                 attempts.append((
-                    "authenticated-default",
+                    "legacy-mweb-web_safari-android",
                     self._youtube_options(
+                        player_clients=["mweb", "web_safari", "android"],
                         use_provider=provider,
+                        use_cookies=True,
                     ),
                 ))
-                if provider:
-                    attempts.append((
-                        "mweb+bgutil",
-                        self._youtube_options(
-                            player_clients=["mweb"],
-                            use_provider=True,
-                        ),
-                    ))
                 attempts.append((
-                    "web_creator",
+                    "web_safari",
                     self._youtube_options(
-                        player_clients=["web_creator"],
-                        use_provider=provider,
+                        player_clients=["web_safari"],
+                        use_provider=False,
+                        use_cookies=True,
                     ),
                 ))
-                # Final guest-only probe. This is useful for public videos and
-                # avoids sending account cookies to a client that does not support
-                # authenticated sessions.
                 attempts.append((
-                    "android_vr-guest",
+                    "mweb+bgutil",
                     self._youtube_options(
-                        player_clients=["android_vr"],
+                        player_clients=["mweb"],
+                        use_provider=provider,
+                        use_cookies=True,
+                    ),
+                ))
+                attempts.append((
+                    "android-guest",
+                    self._youtube_options(
+                        player_clients=["android"],
                         use_provider=False,
                         use_cookies=False,
                     ),
                 ))
             else:
-                # Guest default is selected by yt-dlp itself.
                 attempts.append((
-                    "guest-default",
+                    "legacy-mweb-web_safari-android",
                     self._youtube_options(
+                        player_clients=["mweb", "web_safari", "android"],
                         use_provider=provider,
                         use_cookies=False,
                     ),
@@ -535,7 +545,15 @@ class UrlResolver:
                         ),
                     ))
                 attempts.append((
-                    "android_vr-guest",
+                    "web_safari",
+                    self._youtube_options(
+                        player_clients=["web_safari"],
+                        use_provider=False,
+                        use_cookies=False,
+                    ),
+                ))
+                attempts.append((
+                    "android-vr-guest",
                     self._youtube_options(
                         player_clients=["android_vr"],
                         use_provider=False,
@@ -668,6 +686,9 @@ class UrlResolver:
             "live": bool(info.get("is_live")),
             "video_id": str(info.get("id") or ""),
             "http_headers": allowed_headers,
+            # YouTube URLs are remote FFmpeg/PyTgCalls inputs. Do not fetch
+            # an HLS manifest as if it were a local media file.
+            "remote_stream": bool(is_youtube and stream),
         }
 
     async def resolve(self, url: str) -> dict[str, Any]:
