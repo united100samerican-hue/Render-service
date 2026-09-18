@@ -374,8 +374,8 @@ class UrlResolver:
 
     def _youtube_options(
         self,
-        embedded: bool = False,
-        use_provider: bool | None = None,
+        player_clients: list[str] | None = None,
+        use_provider: bool = False,
     ) -> dict[str, Any]:
         options: dict[str, Any] = {
             "quiet": True,
@@ -385,60 +385,41 @@ class UrlResolver:
             "ignoreerrors": False,
             "socket_timeout": 20,
             "retries": 3,
+            "extractor_retries": 2,
             "fragment_retries": 3,
+            "file_access_retries": 2,
             "concurrent_fragment_downloads": 4,
             "continuedl": True,
             "geo_bypass": True,
-            "http_headers": {
-                "User-Agent": (
-                    "Mozilla/5.0 "
-                    "(X11; Linux x86_64) "
-                    "AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) "
-                    "Chrome/140.0 Safari/537.36"
-                )
-            },
+            # The Audio service downloads the selected URL itself; it does not
+            # execute an HLS/DASH manifest. Prefer direct HTTP(S) progressive
+            # formats so web_embedded SABR/m3u8 formats are not selected as a
+            # local .mp4 file by mistake.
             "format": (
-                "best[ext=mp4][vcodec!=none][acodec!=none]"
-                "/best[vcodec!=none][acodec!=none]"
-                "/best[acodec!=none]"
+                "best[protocol^=http][ext=mp4][vcodec!=none][acodec!=none]"
+                "/best[protocol^=http][vcodec!=none][acodec!=none]"
+                "/best[protocol^=http][acodec!=none]"
+                "/best[protocol^=http]"
                 "/best"
             ),
         }
 
-        if use_provider is None:
-            use_provider = self._provider_available()
-
-        if embedded:
-            options["extractor_args"] = {
-                "youtube": {
-                    "player_client": ["web_embedded"],
-                }
+        extractor_args: dict[str, Any] = {}
+        if player_clients:
+            extractor_args["youtube"] = {
+                "player_client": list(player_clients),
             }
-        elif use_provider:
-            # With valid cookies, let yt-dlp choose its current cookie-aware default
-            # clients. We only force mweb when no account cookies are available.
-            if not self._cookie_file:
-                options["extractor_args"] = {
-                    "youtube": {
-                        "player_client": ["mweb"],
-                    },
-                    "youtubepot-bgutilhttp": {
-                        "base_url": [POT_PROVIDER_URL],
-                    },
-                }
-            else:
-                options["extractor_args"] = {
-                    "youtubepot-bgutilhttp": {
-                        "base_url": [POT_PROVIDER_URL],
-                    }
-                }
+        if use_provider and self._provider_available():
+            extractor_args["youtubepot-bgutilhttp"] = {
+                "base_url": [POT_PROVIDER_URL],
+            }
+        if extractor_args:
+            options["extractor_args"] = extractor_args
 
         deno = shutil.which("deno")
 
         if not deno:
             candidate = "/usr/local/bin/deno"
-
             if Path(candidate).is_file():
                 deno = candidate
 
@@ -485,18 +466,68 @@ class UrlResolver:
             or self._is_youtube_url(source)
         )
 
-        if is_youtube:
-            attempts: list[dict[str, Any]] = []
-            if self._cookie_file:
-                attempts.append(self._youtube_options(embedded=False, use_provider=self._provider_available()))
-                attempts.append(self._youtube_options(embedded=True, use_provider=False))
-                if self._provider_available():
-                    attempts.append(self._youtube_options(embedded=False, use_provider=True))
-            else:
-                attempts.append(self._youtube_options(embedded=False, use_provider=self._provider_available()))
-                attempts.append(self._youtube_options(embedded=True, use_provider=False))
+        attempts: list[tuple[str, dict[str, Any]]] = []
+        provider = self._provider_available() if is_youtube else False
+
+        if is_youtube and self._cookie_file:
+            # Logged-in YouTube currently has problems with tv_downgraded in the
+            # default client. Keep the upstream-recommended default+embedded
+            # chain first, then use explicit fallbacks that do not depend on the
+            # same player-response path.
+            attempts.append((
+                "default+web_embedded",
+                self._youtube_options(
+                    player_clients=["default", "web_embedded"],
+                    use_provider=provider,
+                ),
+            ))
+            attempts.append((
+                "web_embedded",
+                self._youtube_options(
+                    player_clients=["web_embedded"],
+                    use_provider=False,
+                ),
+            ))
+            if provider:
+                attempts.append((
+                    "mweb+bgutil",
+                    self._youtube_options(
+                        player_clients=["mweb"],
+                        use_provider=True,
+                    ),
+                ))
+            attempts.append((
+                "tv",
+                self._youtube_options(
+                    player_clients=["tv"],
+                    use_provider=False,
+                ),
+            ))
+        elif is_youtube:
+            attempts.append((
+                "web_embedded",
+                self._youtube_options(
+                    player_clients=["web_embedded"],
+                    use_provider=False,
+                ),
+            ))
+            if provider:
+                attempts.append((
+                    "mweb+bgutil",
+                    self._youtube_options(
+                        player_clients=["mweb"],
+                        use_provider=True,
+                    ),
+                ))
+            attempts.append((
+                "tv",
+                self._youtube_options(
+                    player_clients=["tv"],
+                    use_provider=False,
+                ),
+            ))
         else:
-            attempts = [self._generic_options()]
+            attempts = [("generic", self._generic_options())]
 
         def run(opts: dict[str, Any]) -> dict[str, Any]:
             with yt_dlp.YoutubeDL(opts) as ydl:
@@ -511,9 +542,19 @@ class UrlResolver:
                 return info
 
         last_exc: Exception | None = None
-        for index, options in enumerate(attempts):
+        for index, (label, options) in enumerate(attempts):
             try:
                 info = run(options)
+                if is_youtube:
+                    log.info(
+                        "youtube extraction succeeded attempt=%d/%d client=%s yt_dlp=%s provider=%s cookies=%s",
+                        index + 1,
+                        len(attempts),
+                        label,
+                        getattr(yt_dlp.version, "__version__", "unknown"),
+                        provider,
+                        bool(self._cookie_file),
+                    )
                 break
             except yt_dlp.utils.DownloadError as exc:
                 last_exc = exc
@@ -523,10 +564,20 @@ class UrlResolver:
                     or "page needs to be reloaded" in message
                     or "no formats" in message
                     or "unable to extract" in message
+                    or "failed to extract" in message
+                    or "player response" in message
+                )
+                log.warning(
+                    "youtube extraction failed attempt=%d/%d client=%s retryable=%s error=%s",
+                    index + 1,
+                    len(attempts),
+                    label,
+                    retryable,
+                    str(exc).splitlines()[0][:300],
                 )
                 if not is_youtube or index >= len(attempts) - 1 or not retryable:
                     raise
-                time.sleep(0.75)
+                time.sleep(0.35)
         else:
             if last_exc is not None:
                 if is_youtube and self._cookie_file and self._is_bot_check_error(last_exc):
