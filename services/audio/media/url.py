@@ -453,6 +453,10 @@ class UrlResolver:
         if use_cookies and self._cookie_file:
             options["cookiefile"] = self._cookie_file
 
+        # Match the previously working Render service: allow yt-dlp to fetch
+        # updated EJS challenge scripts when the bundled package is not enough.
+        options["remote_components"] = ["ejs:github"]
+
         return options
 
     @staticmethod
