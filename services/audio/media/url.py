@@ -394,72 +394,65 @@ class UrlResolver:
         player_clients: list[str] | None = None,
         use_provider: bool = False,
         use_cookies: bool = True,
+        missing_pot: bool = False,
     ) -> dict[str, Any]:
+        trace = str(os.getenv("YOUTUBE_VERBOSE", "")).strip() == "1"
         options: dict[str, Any] = {
-            "quiet": True,
-            "no_warnings": True,
+            "quiet": not trace,
+            "no_warnings": not trace,
+            "verbose": trace,
             "skip_download": True,
             "noplaylist": True,
             "ignoreerrors": False,
             "socket_timeout": 25,
-            "retries": 5,
-            "extractor_retries": 3,
-            "fragment_retries": 5,
-            "file_access_retries": 3,
+            "retries": 2,
+            "extractor_retries": 1,
+            "fragment_retries": 3,
+            "file_access_retries": 2,
             "concurrent_fragment_downloads": 3,
             "continuedl": True,
             "geo_bypass": True,
-            # Prefer a single remote HLS format when available, then progressive HTTP.
-            # FFmpeg/PyTgCalls can consume the returned remote manifest directly.
             "format": (
-                "best[protocol^=m3u8][vcodec!=none][acodec!=none]"
-                "/best[protocol^=m3u8][acodec!=none]"
-                "/best[protocol^=http][vcodec!=none][acodec!=none]"
-                "/best[protocol^=http][acodec!=none]"
+                "best[vcodec!=none][acodec!=none]"
                 "/best[acodec!=none]"
                 "/best"
             ),
         }
 
-        extractor_args: dict[str, Any] = {}
         if player_clients:
-            client_value = ",".join(str(item).strip() for item in player_clients if str(item).strip())
-            if client_value:
-                extractor_args["youtube"] = [
-                    f"player_client={client_value}",
-                    "fetch_pot=always" if use_provider else "fetch_pot=auto",
-                ]
-                if use_provider and str(os.getenv("YOUTUBE_POT_TRACE", "")).strip() == "1":
-                    extractor_args["youtube"].append("pot_trace=true")
+            youtube_args: dict[str, Any] = {
+                "player_client": [
+                    str(item).strip()
+                    for item in player_clients
+                    if str(item).strip()
+                ],
+            }
+            if use_provider:
+                youtube_args["fetch_pot"] = ["auto"]
+            if missing_pot:
+                youtube_args["formats"] = ["missing_pot"]
+            if trace and use_provider:
+                youtube_args["pot_trace"] = ["true"]
 
-        if use_provider and self._provider_available():
-            extractor_args["youtubepot-bgutilhttp"] = [
-                f"base_url={POT_PROVIDER_URL}",
-            ]
+            options["extractor_args"] = {"youtube": youtube_args}
 
-        if extractor_args:
-            options["extractor_args"] = extractor_args
+            if use_provider and self._provider_available():
+                options["extractor_args"]["youtubepot-bgutilhttp"] = {
+                    "base_url": [POT_PROVIDER_URL],
+                }
 
         deno = shutil.which("deno")
         if not deno:
             candidate = "/usr/local/bin/deno"
             if Path(candidate).is_file():
                 deno = candidate
-
         if deno:
-            options["js_runtimes"] = {
-                "deno": {
-                    "path": deno,
-                }
-            }
+            options["js_runtimes"] = {"deno": {"path": deno}}
 
         if use_cookies and self._cookie_file:
             options["cookiefile"] = self._cookie_file
 
-        # Match the previously working Render service: allow yt-dlp to fetch
-        # updated EJS challenge scripts when the bundled package is not enough.
         options["remote_components"] = ["ejs:github"]
-
         return options
 
     @staticmethod
@@ -488,71 +481,79 @@ class UrlResolver:
         }
 
     def _extract(self, source: str) -> dict[str, Any]:
-        is_youtube = (
-            self._is_youtube_search(source)
-            or self._is_youtube_url(source)
-        )
-
+        is_youtube = self._is_youtube_search(source) or self._is_youtube_url(source)
         attempts: list[tuple[str, dict[str, Any]]] = []
         provider = self._provider_available() if is_youtube else False
 
         if is_youtube:
-            if provider and self._cookie_file:
-                attempts.append((
-                    "mweb+bgutil-cookies",
-                    self._youtube_options(
-                        player_clients=["mweb"],
-                        use_provider=True,
-                        use_cookies=True,
-                    ),
-                ))
-            if self._cookie_file:
-                attempts.append((
-                    "web_safari-cookies",
-                    self._youtube_options(
-                        player_clients=["web_safari"],
-                        use_provider=False,
-                        use_cookies=True,
-                    ),
-                ))
-            if provider:
-                attempts.append((
-                    "mweb+bgutil-guest",
-                    self._youtube_options(
-                        player_clients=["mweb"],
-                        use_provider=True,
-                        use_cookies=False,
-                    ),
-                ))
+            attempts.append((
+                "web_embedded-guest",
+                self._youtube_options(
+                    player_clients=["web_embedded"],
+                    use_cookies=False,
+                ),
+            ))
             attempts.append((
                 "web_safari-guest",
                 self._youtube_options(
                     player_clients=["web_safari"],
-                    use_provider=False,
                     use_cookies=False,
                 ),
             ))
-            attempts.append((
-                "android_vr-guest",
-                self._youtube_options(
-                    player_clients=["android_vr"],
-                    use_provider=False,
-                    use_cookies=False,
-                ),
-            ))
+            if provider:
+                attempts.append((
+                    "mweb-guest+pot",
+                    self._youtube_options(
+                        player_clients=["mweb"],
+                        use_provider=True,
+                        use_cookies=False,
+                        missing_pot=True,
+                    ),
+                ))
+            if self._cookie_file:
+                if provider:
+                    attempts.append((
+                        "default+web_embedded-cookies+pot",
+                        self._youtube_options(
+                            player_clients=["default", "web_embedded"],
+                            use_provider=True,
+                            use_cookies=True,
+                        ),
+                    ))
+                    attempts.append((
+                        "mweb-cookies+pot",
+                        self._youtube_options(
+                            player_clients=["mweb"],
+                            use_provider=True,
+                            use_cookies=True,
+                            missing_pot=True,
+                        ),
+                    ))
+                else:
+                    attempts.append((
+                        "default+web_embedded-cookies",
+                        self._youtube_options(
+                            player_clients=["default", "web_embedded"],
+                            use_cookies=True,
+                        ),
+                    ))
+                attempts.append((
+                    "web_safari-cookies",
+                    self._youtube_options(
+                        player_clients=["web_safari"],
+                        use_cookies=True,
+                    ),
+                ))
         else:
             attempts = [("generic", self._generic_options())]
 
         def run(opts: dict[str, Any]) -> dict[str, Any]:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(source, download=False)
-
                 if info and info.get("entries"):
                     info = next((entry for entry in info["entries"] if entry), None)
-
                 if not info:
                     raise RuntimeError("url_metadata_empty")
-
                 return info
 
         last_exc: Exception | None = None
@@ -566,6 +567,7 @@ class UrlResolver:
                 self._pot_version,
                 bool(self._cookie_file),
             )
+
         for index, (label, options) in enumerate(attempts):
             try:
                 info = run(options)
@@ -601,7 +603,7 @@ class UrlResolver:
                 )
                 if not is_youtube or index >= len(attempts) - 1 or not retryable:
                     raise
-                time.sleep(0.35)
+                time.sleep(0.25)
         else:
             if last_exc is not None:
                 if is_youtube and self._cookie_file and self._is_bot_check_error(last_exc):
@@ -611,13 +613,11 @@ class UrlResolver:
                 raise last_exc
 
         stream = str(info.get("url") or "")
-
         if not stream:
             formats = [
                 item for item in (info.get("formats") or [])
                 if item.get("url") and item.get("protocol") not in {"mhtml"}
             ]
-
             if is_youtube:
                 formats = [
                     item
@@ -629,10 +629,8 @@ class UrlResolver:
                     for item in formats
                     if item.get("acodec") not in (None, "none")
                 ] or formats
-
             if not formats:
                 raise RuntimeError("url_stream_not_found")
-
             formats.sort(
                 key=lambda item: (
                     item.get("height") or 0,
@@ -641,7 +639,6 @@ class UrlResolver:
                 ),
                 reverse=True,
             )
-
             chosen = formats[0]
             stream = str(chosen["url"])
             raw_headers = chosen.get("http_headers") or info.get("http_headers") or {}
@@ -676,8 +673,6 @@ class UrlResolver:
             "live": bool(info.get("is_live")),
             "video_id": str(info.get("id") or ""),
             "http_headers": allowed_headers,
-            # YouTube URLs are remote FFmpeg/PyTgCalls inputs. Do not fetch
-            # an HLS manifest as if it were a local media file.
             "remote_stream": bool(is_youtube and stream),
         }
 
