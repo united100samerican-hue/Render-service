@@ -6,7 +6,6 @@ import logging
 import os
 import re
 import shutil
-import socket
 import tempfile
 import time
 from http.cookiejar import MozillaCookieJar
@@ -82,6 +81,7 @@ class UrlResolver:
             "expired_auth_cookies": 0,
         }
         self._pot_available = None
+        self._pot_version = ""
         self._pot_checked_at = 0.0
         self._prepare_cookies()
 
@@ -270,17 +270,24 @@ class UrlResolver:
         self._cookie_status["loaded"] = True
 
         log.info(
-                "youtube cookies configured source=%s valid=%s bytes=%d youtube_domains=%d auth=%d expired_auth=%d",
-                source,
-                bool(self._cookie_file),
-                self._cookie_status.get("bytes", 0),
-                self._cookie_status.get("youtube_domains", 0),
-                self._cookie_status.get("auth_cookies", 0),
-                self._cookie_status.get("expired_auth_cookies", 0),
-            )
+            "youtube cookies configured source=%s valid=%s bytes=%d youtube_domains=%d auth=%d expired_auth=%d",
+            source,
+            bool(self._cookie_file),
+            self._cookie_status.get("bytes", 0),
+            self._cookie_status.get("youtube_domains", 0),
+            self._cookie_status.get("auth_cookies", 0),
+            self._cookie_status.get("expired_auth_cookies", 0),
+        )
 
     def cookie_status(self) -> dict[str, Any]:
-        return dict(self._cookie_status)
+        status = dict(self._cookie_status)
+        status["provider"] = {
+            "configured": bool(POT_PROVIDER_URL),
+            "reachable": self._provider_available(),
+            "url": POT_PROVIDER_URL,
+            "version": self._pot_version,
+        }
+        return status
 
     @staticmethod
     def _is_youtube_url(value: str) -> bool:
@@ -369,13 +376,15 @@ class UrlResolver:
         if now - self._pot_checked_at < 10.0 and self._pot_available is not None:
             return bool(self._pot_available)
 
+        self._pot_version = ""
         try:
-            host = urlsplit(POT_PROVIDER_URL).hostname or "127.0.0.1"
-            port = int(urlsplit(POT_PROVIDER_URL).port or 4416)
-            with socket.create_connection((host, port), timeout=0.25):
-                self._pot_available = True
-        except Exception:
+            response = httpx.get(f"{POT_PROVIDER_URL.rstrip('/')}/ping", timeout=0.8)
+            payload = response.json() if response.content else {}
+            self._pot_version = str(payload.get("version") or "").strip()
+            self._pot_available = response.status_code == 200 and bool(self._pot_version)
+        except Exception as exc:
             self._pot_available = False
+            log.warning("youtube pot provider unavailable url=%s error=%s", POT_PROVIDER_URL, type(exc).__name__)
 
         self._pot_checked_at = now
         return bool(self._pot_available)
@@ -400,10 +409,8 @@ class UrlResolver:
             "concurrent_fragment_downloads": 3,
             "continuedl": True,
             "geo_bypass": True,
-            # Keep the old working format strategy: prefer HLS when a supported
-            # YouTube client exposes it, then fall back to progressive HTTP.
-            # HLS is intentionally allowed here because PyTgCalls/FFmpeg can
-            # play the returned remote manifest directly.
+            # Prefer a single remote HLS format when available, then progressive HTTP.
+            # FFmpeg/PyTgCalls can consume the returned remote manifest directly.
             "format": (
                 "best[protocol^=m3u8][vcodec!=none][acodec!=none]"
                 "/best[protocol^=m3u8][acodec!=none]"
@@ -414,25 +421,21 @@ class UrlResolver:
             ),
         }
 
-        youtube_args: dict[str, Any] = {}
-        if player_clients:
-            # This is deliberately a single yt-dlp extraction using the same
-            # client combination that the old working service used. It lets
-            # yt-dlp merge whichever client returns usable data instead of
-            # forcing each client into isolated attempts.
-            youtube_args["player_client"] = list(player_clients)
-            # Keep formats requiring a PO token visible to yt-dlp. The old
-            # working service explicitly used this with bgutil.
-            youtube_args["formats"] = ["missing_pot"]
-
         extractor_args: dict[str, Any] = {}
-        if youtube_args:
-            extractor_args["youtube"] = youtube_args
+        if player_clients:
+            client_value = ",".join(str(item).strip() for item in player_clients if str(item).strip())
+            if client_value:
+                extractor_args["youtube"] = [
+                    f"player_client={client_value}",
+                    "fetch_pot=always" if use_provider else "fetch_pot=auto",
+                ]
+                if use_provider and str(os.getenv("YOUTUBE_POT_TRACE", "")).strip() == "1":
+                    extractor_args["youtube"].append("pot_trace=true")
 
         if use_provider and self._provider_available():
-            extractor_args["youtubepot-bgutilhttp"] = {
-                "base_url": [POT_PROVIDER_URL],
-            }
+            extractor_args["youtubepot-bgutilhttp"] = [
+                f"base_url={POT_PROVIDER_URL}",
+            ]
 
         if extractor_args:
             options["extractor_args"] = extractor_args
@@ -494,76 +497,49 @@ class UrlResolver:
         provider = self._provider_available() if is_youtube else False
 
         if is_youtube:
-            # Reproduce the extraction strategy from the old service that was
-            # known to work: use one combined client request with mweb,
-            # web_safari and android, while keeping missing-POT formats enabled.
-            if self._cookie_file:
+            if provider and self._cookie_file:
                 attempts.append((
-                    "legacy-mweb-web_safari-android",
-                    self._youtube_options(
-                        player_clients=["mweb", "web_safari", "android"],
-                        use_provider=provider,
-                        use_cookies=True,
-                    ),
-                ))
-                attempts.append((
-                    "web_safari",
-                    self._youtube_options(
-                        player_clients=["web_safari"],
-                        use_provider=False,
-                        use_cookies=True,
-                    ),
-                ))
-                attempts.append((
-                    "mweb+bgutil",
+                    "mweb+bgutil-cookies",
                     self._youtube_options(
                         player_clients=["mweb"],
-                        use_provider=provider,
+                        use_provider=True,
                         use_cookies=True,
                     ),
                 ))
+            if self._cookie_file:
                 attempts.append((
-                    "android-guest",
-                    self._youtube_options(
-                        player_clients=["android"],
-                        use_provider=False,
-                        use_cookies=False,
-                    ),
-                ))
-            else:
-                attempts.append((
-                    "legacy-mweb-web_safari-android",
-                    self._youtube_options(
-                        player_clients=["mweb", "web_safari", "android"],
-                        use_provider=provider,
-                        use_cookies=False,
-                    ),
-                ))
-                if provider:
-                    attempts.append((
-                        "mweb+bgutil",
-                        self._youtube_options(
-                            player_clients=["mweb"],
-                            use_provider=True,
-                            use_cookies=False,
-                        ),
-                    ))
-                attempts.append((
-                    "web_safari",
+                    "web_safari-cookies",
                     self._youtube_options(
                         player_clients=["web_safari"],
                         use_provider=False,
-                        use_cookies=False,
+                        use_cookies=True,
                     ),
                 ))
+            if provider:
                 attempts.append((
-                    "android-vr-guest",
+                    "mweb+bgutil-guest",
                     self._youtube_options(
-                        player_clients=["android_vr"],
-                        use_provider=False,
+                        player_clients=["mweb"],
+                        use_provider=True,
                         use_cookies=False,
                     ),
                 ))
+            attempts.append((
+                "web_safari-guest",
+                self._youtube_options(
+                    player_clients=["web_safari"],
+                    use_provider=False,
+                    use_cookies=False,
+                ),
+            ))
+            attempts.append((
+                "android_vr-guest",
+                self._youtube_options(
+                    player_clients=["android_vr"],
+                    use_provider=False,
+                    use_cookies=False,
+                ),
+            ))
         else:
             attempts = [("generic", self._generic_options())]
 
@@ -580,6 +556,16 @@ class UrlResolver:
                 return info
 
         last_exc: Exception | None = None
+        if is_youtube:
+            log.info(
+                "youtube extraction source=%s attempts=%d yt_dlp=%s provider=%s provider_version=%s cookies=%s",
+                source[:120],
+                len(attempts),
+                getattr(yt_dlp.version, "__version__", "unknown"),
+                provider,
+                self._pot_version,
+                bool(self._cookie_file),
+            )
         for index, (label, options) in enumerate(attempts):
             try:
                 info = run(options)
