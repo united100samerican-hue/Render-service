@@ -15,7 +15,7 @@ SEARCH_PREFIXES=("ytsearch:","ytsearch1:","ytsearch2:","ytsearch3:")
 class UrlResolver:
  def __init__(self):
   self._timeout=20;self._cache_ttl=90;self._cache={};self._cookie_file="";self._cookie_status={"configured":False,"loaded":False,"valid_format":False,"source":"none","bytes":0,"youtube_domains":0,"cookie_rows":0,"auth_cookies":0,"expired_auth_cookies":0}
-  self._pot_available=None;self._pot_version="";self._pot_checked_at=0.0;self._prepare_cookies()
+  self._pot_available=None;self._pot_version="";self._pot_checked_at=0.0;self._yt_dlp_auth_checked_at=0.0;self._yt_dlp_auth_status={"checked":False,"detected":False,"login_info":False,"sapisid":False,"cookie_count":0,"error":""};self._prepare_cookies()
  def _cache_get(self,source):
   item=self._cache.get(source)
   if not item:return None
@@ -88,9 +88,30 @@ class UrlResolver:
    except Exception:pass
    self._cookie_status.update(valid_format=False,load_error=type(exc).__name__);return
   self._cookie_status["loaded"]=True
-  log.info("youtube cookies configured source=%s valid=%s bytes=%d youtube_domains=%d auth=%d expired_auth=%d login_info=%s sapisid=%d",source,bool(self._cookie_file),self._cookie_status["bytes"],self._cookie_status["youtube_domains"],self._cookie_status["auth_cookies"],self._cookie_status["expired_auth_cookies"],self._cookie_status.get("login_info"),self._cookie_status.get("sapisid_cookies",0))
+  self._check_yt_dlp_cookie_auth(force=True)
+  log.info("youtube cookies configured source=%s valid=%s bytes=%d youtube_domains=%d auth=%d expired_auth=%d login_info=%s sapisid=%d yt_dlp_auth=%s yt_dlp_login=%s yt_dlp_sapisid=%s",source,bool(self._cookie_file),self._cookie_status["bytes"],self._cookie_status["youtube_domains"],self._cookie_status["auth_cookies"],self._cookie_status["expired_auth_cookies"],self._cookie_status.get("login_info"),self._cookie_status.get("sapisid_cookies",0),self._yt_dlp_auth_status.get("detected"),self._yt_dlp_auth_status.get("login_info"),self._yt_dlp_auth_status.get("sapisid"))
+ def _check_yt_dlp_cookie_auth(self,force=False):
+  now=time.time()
+  if not force and self._yt_dlp_auth_status.get("checked") and now-self._yt_dlp_auth_checked_at<60:return dict(self._yt_dlp_auth_status)
+  result={"checked":True,"detected":False,"login_info":False,"sapisid":False,"cookie_count":0,"error":""}
+  if not self._cookie_file:
+   self._yt_dlp_auth_status=result;self._yt_dlp_auth_checked_at=now;return result
+  try:
+   with yt_dlp.YoutubeDL({"quiet":True,"no_warnings":True,"cookiefile":self._cookie_file}) as ydl:
+    ie=ydl.get_info_extractor("Youtube")
+    jar=getattr(ie,"_youtube_cookies",None)
+    cookies=list(jar) if jar is not None else []
+    result["cookie_count"]=len(cookies)
+    names={str(c.name).upper():c.value for c in cookies if c.value is not None}
+    result["login_info"]="LOGIN_INFO" in names
+    result["sapisid"]=any(names.get(n) for n in ("SAPISID","__SECURE-1PAPISID","__SECURE-3PAPISID"))
+    result["detected"]=bool(getattr(ie,"is_authenticated",False))
+  except Exception as exc:
+   result["error"]=type(exc).__name__
+  self._yt_dlp_auth_status=result;self._yt_dlp_auth_checked_at=now
+  return dict(result)
  def cookie_status(self):
-  status=dict(self._cookie_status);status["provider"]={"configured":bool(POT_PROVIDER_URL),"reachable":self._provider_available(),"url":POT_PROVIDER_URL,"version":self._pot_version};status["yt_dlp"]=getattr(yt_dlp.version,"__version__","unknown");return status
+  auth=self._check_yt_dlp_cookie_auth();status=dict(self._cookie_status);status["yt_dlp_auth"]=auth;status["provider"]={"configured":bool(POT_PROVIDER_URL),"reachable":self._provider_available(),"url":POT_PROVIDER_URL,"version":self._pot_version};status["yt_dlp"]=getattr(yt_dlp.version,"__version__","unknown");return status
  @staticmethod
  def _is_youtube_url(value):
   raw=str(value or "").strip()
@@ -189,7 +210,9 @@ class UrlResolver:
   return str(files[0])
  def _extract(self,source,download=False,outdir=""):
   is_yt=self._is_youtube_search(source) or self._is_youtube_url(source);attempts=self._attempts() if is_yt else [("generic",self._generic_options())]
-  if is_yt:log.info("youtube extraction source=%s attempts=%d yt_dlp=%s provider=%s provider_version=%s cookies=%s download=%s",source[:120],len(attempts),getattr(yt_dlp.version,"__version__","unknown"),self._pot_available,self._pot_version,bool(self._cookie_file),download)
+  if is_yt:
+   auth=self._check_yt_dlp_cookie_auth()
+   log.info("youtube extraction source=%s attempts=%d yt_dlp=%s provider=%s provider_version=%s cookies=%s yt_dlp_auth=%s yt_dlp_login=%s yt_dlp_sapisid=%s download=%s",source[:120],len(attempts),getattr(yt_dlp.version,"__version__","unknown"),self._pot_available,self._pot_version,bool(self._cookie_file),auth.get("detected"),auth.get("login_info"),auth.get("sapisid"),download)
   last=None
   for i,(label,base_opts) in enumerate(attempts):
    opts=dict(base_opts)
@@ -206,7 +229,11 @@ class UrlResolver:
     break
    except (yt_dlp.utils.DownloadError,RuntimeError) as exc:
     last=exc;msg=str(exc).lower();retryable=self._is_bot_check_error(exc) or any(x in msg for x in ("no formats","unable to extract","failed to extract","player response","page needs to be reloaded","download failed"))
-    log.warning("youtube extraction failed attempt=%d/%d client=%s retryable=%s error=%s",i+1,len(attempts),label,retryable,str(exc).splitlines()[0][:300])
+    if is_yt:
+     auth=self._check_yt_dlp_cookie_auth()
+     log.warning("youtube extraction failed attempt=%d/%d client=%s retryable=%s yt_dlp_auth=%s error=%s",i+1,len(attempts),label,retryable,auth.get("detected"),str(exc).splitlines()[0][:300])
+    else:
+     log.warning("youtube extraction failed attempt=%d/%d client=%s retryable=%s error=%s",i+1,len(attempts),label,retryable,str(exc).splitlines()[0][:300])
     if not is_yt or i>=len(attempts)-1 or not retryable:raise
     if download and outdir:
      try:
