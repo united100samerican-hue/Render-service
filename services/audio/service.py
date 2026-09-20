@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import shutil
 import subprocess
 import tempfile
@@ -366,20 +367,116 @@ class AudioService:
     async def _resolve_url(
         self,
         source_id: str,
+        metadata_only: bool = False,
     ) -> dict[str, Any]:
-        source = str(
-            source_id or "",
-        ).strip()
-
+        source = str(source_id or "").strip()
         if not source:
-            raise RuntimeError(
-                "url_missing",
-            )
-
+            raise RuntimeError("url_missing")
         async with self._url_lock(source):
             return await self.urls.resolve(
                 source,
+                download=not metadata_only,
+                output_dir=str(self.root),
             )
+
+    @staticmethod
+    def _youtube_video_id(source: str) -> str:
+        raw = str(source or "").strip()
+        if raw.lower().startswith(("ytsearch:", "ytsearch1:", "ytsearch2:", "ytsearch3:")):
+            return ""
+        try:
+            from urllib.parse import parse_qs, urlsplit
+            p = urlsplit(raw)
+            host = (p.hostname or "").lower()
+            if host in {"youtu.be", "www.youtu.be"}:
+                return p.path.strip("/").split("/")[0]
+            q = parse_qs(p.query)
+            if q.get("v"):
+                return q["v"][0]
+            m = re.search(r"/(?:shorts|embed|live)/([A-Za-z0-9_-]{6,})", p.path)
+            return m.group(1) if m else ""
+        except Exception:
+            return ""
+
+    def _youtube_cache_key(self, video_id: str, suffix: str = ".mp4") -> str:
+        return self.cache.key_for("youtube", "v3", video_id, "video720", suffix=suffix)
+
+    def _youtube_meta_key(self, video_id: str) -> str:
+        return self.cache.key_for("youtube", "v3", video_id, "video720", "meta", suffix=".json")
+
+    async def _restore_youtube_cache(
+        self,
+        source: str,
+        title: str = "",
+        duration: int = 0,
+    ) -> dict[str, Any] | None:
+        if not self.cache.enabled:
+            return None
+        video_id = self._youtube_video_id(source)
+        if not video_id:
+            return None
+        for ext, kind in ((".mp4", "video"), (".m4a", "audio"), (".webm", "video"), (".mkv", "video")):
+            key = self._youtube_cache_key(video_id, ext)
+            local = self.root / f"r2_yt_{video_id}{ext}"
+            if not await self.cache.download(key, local):
+                continue
+            meta = await self.cache.get_json(self._youtube_meta_key(video_id)) or {}
+            result = {
+                "source_url": str(meta.get("source_url") or source),
+                "stream_url": str(local),
+                "title": str(meta.get("title") or title or "غير معروف"),
+                "duration": int(meta.get("duration") or duration or 0),
+                "webpage_url": str(meta.get("webpage_url") or source),
+                "thumbnail": str(meta.get("thumbnail") or f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"),
+                "video": bool(meta.get("video", kind == "video")),
+                "media_kind": str(meta.get("media_kind") or kind),
+                "live": bool(meta.get("live", False)),
+                "video_id": video_id,
+                "http_headers": {},
+                "local_path": str(local),
+                "cache_key": key,
+                "remote_stream": False,
+            }
+            if not result["duration"]:
+                result["duration"] = self._probe_duration(str(local))
+            log.info("youtube r2 cache hit video_id=%s", video_id)
+            return result
+        return None
+
+    async def _cache_youtube_result(
+        self,
+        result: dict[str, Any],
+        source: str,
+    ) -> dict[str, Any]:
+        path = Path(str(result.get("local_path") or result.get("stream_url") or ""))
+        if not path.is_file() or path.stat().st_size <= 1024:
+            raise RuntimeError("youtube_local_media_missing")
+        video_id = str(result.get("video_id") or self._youtube_video_id(source)).strip()
+        if not video_id:
+            return result
+        suffix = path.suffix.lower() or ".mp4"
+        if suffix not in {".mp4", ".m4a", ".webm", ".mkv"}:
+            suffix = ".mp4"
+        key = self._youtube_cache_key(video_id, suffix)
+        meta_key = self._youtube_meta_key(video_id)
+        await self.cache.upload(path, key)
+        await self.cache.put_json(meta_key, {
+            "source_url": str(result.get("source_url") or source),
+            "webpage_url": str(result.get("webpage_url") or source),
+            "title": str(result.get("title") or "غير معروف"),
+            "duration": int(result.get("duration") or self._probe_duration(str(path)) or 0),
+            "thumbnail": str(result.get("thumbnail") or f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"),
+            "video": bool(result.get("video")),
+            "media_kind": str(result.get("media_kind") or ("video" if result.get("video") else "audio")),
+            "live": bool(result.get("live", False)),
+            "video_id": video_id,
+        })
+        out = dict(result)
+        out["cache_key"] = key
+        out["local_path"] = str(path)
+        out["stream_url"] = str(path)
+        out["remote_stream"] = False
+        return out
 
     async def _telegram_message_metadata(
         self,
@@ -532,19 +629,24 @@ class AudioService:
             "youtube",
             "yt",
         }:
-            result = await self._resolve_url(
-                source_id,
-            )
-
             if metadata_only:
-                return result
+                return await self._resolve_url(source_id, metadata_only=True)
 
-            # Preserve the old working YouTube behavior: play the extracted
-            # remote stream URL directly through PyTgCalls/FFmpeg. This is
-            # especially important for web_safari HLS URLs; downloading the
-            # .m3u8 text with httpx would not produce a playable media file.
-            if result.get("remote_stream"):
-                return result
+            source = str(source_id or "").strip()
+            cached = await self._restore_youtube_cache(
+                source,
+                title=title,
+                duration=duration,
+            )
+            if cached:
+                return cached
+
+            result = await self._resolve_url(
+                source,
+                metadata_only=False,
+            )
+            if self.urls._is_youtube_search(source) or self.urls._is_youtube_url(source):
+                return await self._cache_youtube_result(result, source)
 
             return await self._materialize_url(
                 result,
