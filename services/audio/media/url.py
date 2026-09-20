@@ -98,16 +98,18 @@ class UrlResolver:
    self._yt_dlp_auth_status=result;self._yt_dlp_auth_checked_at=now;return result
   try:
    with yt_dlp.YoutubeDL({"quiet":True,"no_warnings":True,"cookiefile":self._cookie_file}) as ydl:
+    jar=ydl.cookiejar
+    cookies=list(jar)
+    yt_cookies=[c for c in cookies if str(getattr(c,"domain","")).lower().lstrip(".")=="youtube.com" or str(getattr(c,"domain","")).lower().endswith(".youtube.com")]
+    result["cookie_count"]=len(yt_cookies)
+    names={str(c.name):str(c.value or "") for c in yt_cookies}
+    result["login_info"]=bool(names.get("LOGIN_INFO"))
+    result["sapisid"]=any(bool(names.get(n)) for n in ("SAPISID","__Secure-1PAPISID","__Secure-3PAPISID"))
     ie=ydl.get_info_extractor("Youtube")
-    jar=getattr(ie,"_youtube_cookies",None)
-    cookies=list(jar) if jar is not None else []
-    result["cookie_count"]=len(cookies)
-    names={str(c.name).upper():c.value for c in cookies if c.value is not None}
-    result["login_info"]="LOGIN_INFO" in names
-    result["sapisid"]=any(names.get(n) for n in ("SAPISID","__SECURE-1PAPISID","__SECURE-3PAPISID"))
+    ie.initialize()
     result["detected"]=bool(getattr(ie,"is_authenticated",False))
   except Exception as exc:
-   result["error"]=type(exc).__name__
+   result["error"]=f"{type(exc).__name__}:{str(exc)[:120]}"
   self._yt_dlp_auth_status=result;self._yt_dlp_auth_checked_at=now
   return dict(result)
  def cookie_status(self):
