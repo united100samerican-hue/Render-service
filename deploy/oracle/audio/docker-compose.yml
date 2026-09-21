@@ -1,0 +1,30 @@
+services:
+  audio:
+    build:
+      context: ../../../services/audio
+      dockerfile: Dockerfile
+    container_name: render-audio
+    env_file:
+      - ./.env
+    environment:
+      PORT: "10000"
+    ports:
+      # Host loopback only. Cloudflare Tunnel is the public ingress.
+      - "127.0.0.1:10000:10000"
+    volumes:
+      # Keep the existing service.py tempfile path unchanged.
+      - /srv/audio-media:/tmp/render_audio_media:rw
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS --max-time 3 http://127.0.0.1:10000/ping >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 45s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
