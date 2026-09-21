@@ -1,1 +1,12 @@
+# Optional locally-managed Tunnel configuration.
+# The simpler production path for this project is a remotely-managed tunnel
+# installed with `sudo cloudflared service install <TUNNEL_TOKEN>` from the
+# Cloudflare dashboard. Never commit the real credentials JSON or tunnel token.
 
+tunnel: YOUR_TUNNEL_UUID
+credentials-file: /etc/cloudflared/YOUR_TUNNEL_UUID.json
+
+ingress:
+  - hostname: audio.example.com
+    service: http://127.0.0.1:10000
+  - service: http_status:404
