@@ -1,0 +1,18 @@
+[Unit]
+Description=Render Audio Docker Compose stack
+Requires=docker.service
+After=docker.service
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/Render-service/deploy/oracle/audio
+ExecStart=/usr/bin/docker compose up -d audio
+ExecStop=/usr/bin/docker compose stop audio
+RemainAfterExit=yes
+TimeoutStartSec=0
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target

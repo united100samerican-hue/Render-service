@@ -1,1 +1,9 @@
+[Unit]
+Description=Render Audio health and resource monitor
+Requires=render-audio-compose.service
+After=render-audio-compose.service
 
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/Render-service/deploy/oracle/audio
+ExecStart=/opt/Render-service/deploy/oracle/audio/scripts/health-monitor.sh
