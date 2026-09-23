@@ -187,6 +187,14 @@ class AudioService:
         self.telegram_media = None
         self.ready = False
 
+        cookie_file = str(getattr(self.urls, "_cookie_file", "") or "")
+        if cookie_file:
+            self._clean_file(cookie_file)
+            try:
+                self.urls._cookie_file = ""
+            except Exception:
+                pass
+
         self._clean_all()
         self.url_locks.clear()
 
@@ -221,9 +229,26 @@ class AudioService:
             pass
 
         try:
+            active_cookie = str(
+                getattr(self.urls, "_cookie_file", "") or ""
+            )
+            active_cookie = (
+                Path(active_cookie).resolve()
+                if active_cookie
+                else None
+            )
+
             for path in Path(
                 tempfile.gettempdir()
             ).glob("youtube_cookies_*.txt"):
+                if active_cookie:
+                    try:
+                        if path.resolve() == active_cookie:
+                            continue
+                    except Exception:
+                        if str(path) == str(active_cookie):
+                            continue
+
                 path.unlink(missing_ok=True)
         except Exception:
             pass
